@@ -65,3 +65,9 @@
                  (:file "nostr-tests")
                  (:file "marmot-tests")
                  (:file "group-tests")))))
+
+;;; wss:// support through seal (pure-CL TLS 1.3, github.com/modus-lisp/seal),
+;;; which needs natrium.  Optional: plain ws:// works without it.
+(asdf:defsystem #:cl-marmot/wss
+  :depends-on (#:cl-marmot #:seal)
+  :components ((:module "src" :components ((:module "client" :components ((:file "wss")))))))

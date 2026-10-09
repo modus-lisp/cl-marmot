@@ -86,9 +86,9 @@
       (let ((key (octets->base64 (random-octets 16))))
         (conn-write conn
                     (string->utf8
-                          (format nil "GET ~A HTTP/1.1~C~CHost: ~A~:[:~D~;~*~]~C~CUpgrade: websocket~C~CConnection: Upgrade~C~CSec-WebSocket-Key: ~A~C~CSec-WebSocket-Version: 13~C~C~C~C"
+                          (format nil "GET ~A HTTP/1.1~C~CHost: ~A~:[:~D~;~*~]~C~CUser-Agent: cl-marmot~C~CUpgrade: websocket~C~CConnection: Upgrade~C~CSec-WebSocket-Key: ~A~C~CSec-WebSocket-Version: 13~C~C~C~C"
                                   path #\Return #\Newline host (= port (if secure 443 80)) port
-                                  #\Return #\Newline #\Return #\Newline #\Return #\Newline
+                                  #\Return #\Newline #\Return #\Newline #\Return #\Newline #\Return #\Newline
                                   key #\Return #\Newline #\Return #\Newline #\Return #\Newline)))
         (let ((status (%ws-read-line conn))
               (accept nil))
