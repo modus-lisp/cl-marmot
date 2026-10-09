@@ -543,12 +543,19 @@ admin), then publishes a SelfRemove proposal for a remaining member to commit."
       (%publish acct (mg-relays mg) ev)
       (setf (marmot-group-leaving mg) t))))
 
+(defparameter *auto-commit-max-members* 8
+  "Commit peers' SelfRemove proposals automatically only in chats this small.
+member-departure.md lets any remaining member commit them (a SHOULD, after a
+random delay); in a large group many other clients will, and racing them only
+adds competing commits.")
+
 (defun commit-pending-self-removes (acct)
   "Commit retained peer SelfRemove proposals (one SelfRemove-only commit per
-group).  Returns the groups advanced."
+small group).  Returns the groups advanced."
   (loop for mg being the hash-values of (account-groups acct)
         for removes = (and (mls-group-active (marmot-group-mls mg))
                            (not (marmot-group-leaving mg))
+                           (<= (length (mls-group-members (marmot-group-mls mg))) *auto-commit-max-members*)
                            (pending-self-removes mg))
         when removes
           collect (handler-case (progn (stage-commit mg :by-reference removes)
