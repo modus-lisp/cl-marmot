@@ -91,3 +91,13 @@
   (let ((dir (or (cl-marmot::getenv "CL_MARMOT_VECTORS")
                  "/home/claude/marmot-ref/mls-implementations/test-vectors/")))
     (concatenate 'string dir name)))
+
+(defun fixture-dir ()
+  "test/fixtures/ of this checkout: CL_MARMOT_ROOT, else ASDF's idea of the
+system's source directory."
+  (let ((root (cl-marmot::getenv "CL_MARMOT_ROOT"))
+        (asdf-dir (and (find-package "ASDF") (find-symbol "SYSTEM-SOURCE-DIRECTORY" "ASDF"))))
+    (cond (root (concatenate 'string (string-right-trim "/" root) "/test/fixtures/"))
+          ((and asdf-dir (fboundp asdf-dir))
+           (namestring (merge-pathnames "test/fixtures/" (funcall asdf-dir "cl-marmot"))))
+          (t (error "set CL_MARMOT_ROOT to the cl-marmot checkout")))))

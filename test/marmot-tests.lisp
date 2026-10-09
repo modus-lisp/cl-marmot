@@ -25,9 +25,7 @@
            "proof bound to a different MLS key"))
 
 (defun %fixture (name)
-  (with-open-file (in (merge-pathnames (concatenate 'string "test/fixtures/" name)
-                                       (asdf:system-source-directory :cl-marmot))
-                      :external-format :utf-8)
+  (with-open-file (in (concatenate 'string (fixture-dir) name) :external-format :utf-8)
     (let* ((text (make-string (file-length in)))
            (n (read-sequence text in)))
       (subseq text 0 n))))
