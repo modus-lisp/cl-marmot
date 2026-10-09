@@ -12,6 +12,18 @@
          (sym (and pkg (find-symbol name pkg))))
     (and sym (fboundp sym) (symbol-function sym))))
 
+(defun %sym (package name)
+  "PACKAGE::NAME, looked up at run time; signals if this Lisp lacks it."
+  (or (and (find-package package) (find-symbol name package))
+      (error "~A::~A is not available in this Lisp" package name)))
+
+(defun %call (package name &rest args)
+  (apply (symbol-function (%sym package name)) args))
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (unless (find-package "SB-BSD-SOCKETS")
+    (ignore-errors (require "SB-BSD-SOCKETS"))))
+
 (defun getenv (name)
   (let ((fn (%ext-fn "SB-EXT" "POSIX-GETENV")))
     (and fn (funcall fn name))))

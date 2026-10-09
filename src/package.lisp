@@ -10,14 +10,16 @@
 ;;;;   nostr/   Marmot-strict event handling over cl-nostr (events, NIP-44,
 ;;;;            NIP-59, bech32 and the relay pool are cl-nostr's)
 ;;;;   marmot/  Marmot components, group flows, app events
-;;;;   client/  account store and the interactive client
+;;;;   client/  account orchestration and the persistent store
+;;;;
+;;;; This package is the implementation.  The public API is the MARMOT package
+;;;; (api.lisp); the `marmot` command line (cli.lisp) is written against it.
 ;;;;
 ;;;; Dependencies are the modus-lisp libraries natrium, secp256k1-fast, seal
 ;;;; and cl-nostr; this package reaches cl-nostr through local nicknames.
 
 (defpackage #:cl-marmot
   (:use #:common-lisp)
-  (:nicknames #:marmot)
   (:local-nicknames (#:ev #:cl-nostr.event)
                     (#:k #:cl-nostr.keys)
                     (#:b32 #:cl-nostr.bech32)

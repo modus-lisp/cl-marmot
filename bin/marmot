@@ -7,5 +7,5 @@ here="$(cd "$(dirname "$0")/.." && pwd)"
 exec sbcl --noinform --non-interactive --no-userinit \
   --load "$here/load-deps.lisp" \
   --eval "(let ((*standard-output* (make-broadcast-stream)) (*error-output* (make-broadcast-stream))) (handler-bind ((warning (function muffle-warning))) (ql:quickload :cl-marmot :silent t)))" \
-  --eval '(sb-ext:exit :code (cl-marmot::cli-main (rest sb-ext:*posix-argv*)) :abort t)' \
+  --eval '(sb-ext:exit :code (marmot:cli-main (rest sb-ext:*posix-argv*)) :abort t)' \
   --end-toplevel-options "$@"

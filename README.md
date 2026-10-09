@@ -46,22 +46,50 @@ McGrew–Viega GCM, all 19 BIP-340 rows), and the NIP-44 v2 vectors run against 
 WN_BIN=/path/to/wn-dir test/interop/run-wn-interop.sh
 ```
 
-## Using it
+## Lisp API
+
+The public API is the `MARMOT` package (`src/api.lisp`):
+
+```lisp
+(load "load-deps.lisp") (ql:quickload :cl-marmot)
+
+(marmot:with-account (c)                       ; $MARMOT_HOME or ~/.local/share/cl-marmot/
+  (marmot:add-handler c (lambda (e)
+                          (when (eq (marmot:event-type e) :message)
+                            (let ((m (marmot:event-message e)))
+                              (format t "~A: ~A~%" (marmot:message-sender m) (marmot:message-content m))))))
+  (let ((chat (marmot:create-chat c '("ynniv@ynniv.com"))))   ; npub, hex or NIP-05; empty name = 1:1
+    (marmot:send c chat "hello"))
+  (marmot:start c)                             ; background sync, and serve the CLI socket
+  (sleep 600))
+```
+
+| | |
+|---|---|
+| accounts | `create-account` `open-account` `close-account` `with-account` `npub` `pubkey` `relays` `publish-key-package` |
+| chats | `chats` `find-chat` `chat-id` `chat-name` `chat-description` `chat-members` `chat-admins` `chat-epoch` `chat-active-p` `chat-leaving-p` `chat-messages` |
+| messages | `message-id` `message-chat-id` `message-sender` `message-kind` `message-content` `message-tags` `message-created-at` `message-epoch` `message-own-p` |
+| actions | `create-chat` `send` `invite` `remove-members` `rename` `promote` `demote` `leave` `self-update` |
+| events | `sync` `start` `stop` `running-p` `add-handler` `remove-handler`; `event-type` (`:message` `:joined` `:member-added` `:member-removed` `:renamed` `:removed` `:epoch` `:rejected`), `event-chat` `event-message` `event-account` `event-detail` |
+
+An open client owns its account: a lock file keeps other processes out (two writers would reuse MLS message keys),
+and a recursive lock makes the API safe to call from the application's threads while the background thread syncs.
+Every change is saved before the call returns. Handlers run outside the lock, so they may call back into the API.
+
+## Command line
 
 ```
-bin/marmot init --relay wss://relay.example --name alice   # creates and publishes an account
-bin/marmot create "book club" npub1...                       # founding group with invitees
-bin/marmot groups
-bin/marmot send "book club" hello everyone
-bin/marmot watch                                             # follow incoming traffic
+bin/marmot init --relay wss://relay.damus.io --relay wss://nos.lol --name alice
+bin/marmot create "" ynniv@ynniv.com                   # a one-to-one chat
+bin/marmot send 1e81d2b5 hello                          # CHAT: id, id prefix or name
+bin/marmot daemon &                                     # hold the account, sync in the background
+bin/marmot messages 1e81d2b5                            # ...forwarded to the daemon
 ```
 
-`bin/marmot help` lists every command (`invite`, `remove`, `rename`, `promote`, `demote`, `leave`, `self-update`,
-`members`, `messages`, `keypackage`, …). State lives in `$MARMOT_HOME/account.sexp` (default
-`~/.local/share/cl-marmot/`); **that file holds every secret the account has — protect it.**
-
-From Lisp, the same operations are functions on an `account` (`src/client/account.lisp`): `setup-account`, `sync`,
-`create-group-with`, `invite`, `send-message`, `remove-members`, `leave-group`, ….
+Whatever process holds the account — `marmot daemon`, `marmot watch` (the same, printing what arrives), or an
+application that called `marmot:start` — listens on `$MARMOT_HOME/marmot.sock` (owner-only). Other `marmot`
+commands find it and run inside that process instead of failing on the lock. `bin/marmot help` lists every command.
+The account file holds every secret the account has and is written owner-only.
 
 ## Layout
 
@@ -72,7 +100,9 @@ src/mls/      RFC 9420 + draft-ietf-mls-extensions-10: structures, HPKE, ratchet
               secret tree, framing, group state machine (create/commit/process/Welcome/join)
 src/nostr/    Marmot-strict event decoding and tag rules over cl-nostr
 src/marmot/   app components, KeyPackages (kind 30443), group validation, kind 445 envelopes, app events
-src/client/   account orchestration, persistent store, CLI
+src/client/   account orchestration, persistent store, account lock
+src/api.lisp  the public MARMOT package
+src/cli.lisp  the `marmot` command line and its socket
 test/         unit tests, MLS/NIP-44 vectors, wn interop harness
 ```
 

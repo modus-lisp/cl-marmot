@@ -147,10 +147,23 @@
     (setf (account-last-sync acct) (or (getf s :last-sync) 0))
     acct))
 
+(defun chmod-private (path)
+  "Make PATH readable and writable by its owner only (where the Lisp exposes
+chmod: SB-POSIX on SBCL and in Modus's compatibility surface)."
+  (let ((chmod (%ext-fn "SB-POSIX" "CHMOD")))
+    (when chmod (ignore-errors (funcall chmod (namestring path) #o600)))))
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (unless (find-package "SB-POSIX") (ignore-errors (require "SB-POSIX"))))
+
 (defun save-account (acct path)
   (let ((tmp (concatenate 'string (namestring path) ".tmp")))
     (ensure-directories-exist path)
-    (with-open-file (out tmp :direction :output :if-exists :supersede :external-format :utf-8)
+    ;; create the temporary file empty and private before any secret is written
+    (with-open-file (out tmp :direction :output :if-exists :supersede) (declare (ignorable out)))
+    (chmod-private tmp)
+    ;; :overwrite keeps the (private) file we just made rather than replacing it
+    (with-open-file (out tmp :direction :output :if-exists :overwrite :external-format :utf-8)
       (with-standard-io-syntax
         (let ((*package* (find-package '#:cl-marmot))
               (*print-readably* nil)
@@ -193,18 +206,31 @@
       (format out "~D ~D~%" (or (%pid) 0) (unix-time))
       t)))
 
-(defun call-with-account-lock (account-path fn)
+(defun acquire-account-lock (account-path)
+  "Take the account's lock file; returns its path.  Signals ACCOUNT-IN-USE if a
+live process holds it."
   (let ((lock (concatenate 'string (namestring account-path) ".lock")))
     (ensure-directories-exist lock)
     (unless (%try-create-lock lock)
       (let* ((holder (ignore-errors (with-open-file (in lock) (read in nil nil))))
              (alive (%pid-alive-p holder)))
-        (if (and (null alive) (ignore-errors (delete-file lock)) (%try-create-lock lock))
-            nil                         ; stale lock taken over
-            (error "the account is in use by another marmot process~@[ (pid ~D)~]; ~
-                    if that is wrong, remove ~A" (and (integerp holder) (plusp holder) holder) lock))))
+        (unless (and (null alive) (ignore-errors (delete-file lock)) (%try-create-lock lock))
+          (error 'account-in-use :lock lock :pid (and (integerp holder) (plusp holder) holder)))))
+    lock))
+
+(defun release-account-lock (lock) (ignore-errors (delete-file lock)))
+
+(define-condition account-in-use (marmot-error)
+  ((lock :initarg :lock :reader account-in-use-lock)
+   (pid :initarg :pid :initform nil :reader account-in-use-pid))
+  (:report (lambda (c s)
+             (format s "the account is in use by another marmot process~@[ (pid ~D)~]; ~
+                        if that is wrong, remove ~A" (account-in-use-pid c) (account-in-use-lock c)))))
+
+(defun call-with-account-lock (account-path fn)
+  (let ((lock (acquire-account-lock account-path)))
     (unwind-protect (funcall fn)
-      (ignore-errors (delete-file lock)))))
+      (release-account-lock lock))))
 
 (defmacro with-account-lock ((account-path) &body body)
   `(call-with-account-lock ,account-path (lambda () ,@body)))

@@ -3,7 +3,7 @@
 (asdf:defsystem #:cl-marmot
   :description "A Marmot protocol client: MLS (RFC 9420) group messaging over Nostr, in portable Common Lisp."
   :license "MIT"
-  :depends-on (#:natrium #:secp256k1-fast #:seal #:cl-nostr)
+  :depends-on (#:natrium #:secp256k1-fast #:seal #:cl-nostr #:bordeaux-threads)
   :serial t
   :components
   ((:module "src"
@@ -40,8 +40,9 @@
      (:module "client"
       :serial t
       :components ((:file "account")
-                   (:file "store")
-                   (:file "cli")))))))
+                   (:file "store")))
+     (:file "api")
+     (:file "cli")))))
 
 (asdf:defsystem #:cl-marmot/test
   :depends-on (#:cl-marmot)
