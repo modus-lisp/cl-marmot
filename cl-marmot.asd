@@ -48,7 +48,9 @@
                    (:file "groups")))
      (:module "client"
       :serial t
-      :components ((:file "account")))))))
+      :components ((:file "account")
+                   (:file "store")
+                   (:file "cli")))))))
 
 (asdf:defsystem #:cl-marmot/test
   :depends-on (#:cl-marmot)
@@ -61,4 +63,5 @@
                  (:file "util-tests")
                  (:file "mls-vector-tests")
                  (:file "nostr-tests")
-                 (:file "marmot-tests")))))
+                 (:file "marmot-tests")
+                 (:file "group-tests")))))

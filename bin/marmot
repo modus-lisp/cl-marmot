@@ -1,0 +1,10 @@
+#!/bin/sh
+# marmot — the cl-marmot command line client (SBCL).
+# The system is compiled on first use and cached by ASDF.
+here="$(cd "$(dirname "$0")/.." && pwd)"
+exec sbcl --noinform --non-interactive --no-userinit \
+  --eval '(require :asdf)' \
+  --eval "(push #p\"$here/\" asdf:*central-registry*)" \
+  --eval '(let ((*standard-output* (make-broadcast-stream)) (*error-output* (make-broadcast-stream))) (handler-bind ((warning (function muffle-warning))) (asdf:load-system :cl-marmot)))' \
+  --eval '(sb-ext:exit :code (cl-marmot::cli-main (rest sb-ext:*posix-argv*)))' \
+  --end-toplevel-options "$@"
