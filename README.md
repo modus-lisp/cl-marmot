@@ -54,6 +54,12 @@ bin/marmot watch                                             # follow incoming t
 From Lisp, the same operations are functions on an `account` (`src/client/account.lisp`): `setup-account`, `sync`,
 `create-group-with`, `invite`, `send-message`, `remove-members`, `leave-group`, ….
 
+## TLS
+
+`wss://` relays use [seal](https://github.com/modus-lisp/seal), the pure-CL TLS 1.3 client, with full certificate
+validation (system `cl-marmot/wss`; `bin/marmot` loads it when seal and natrium are found, see `MODUS_LISP`).
+Without it only `ws://` relays work.
+
 ## Layout
 
 ```
@@ -69,11 +75,8 @@ test/         unit tests, MLS/NIP-44 vectors, wn interop harness
 
 ## Not done yet
 
-- **TLS** comes from [seal](https://github.com/modus-lisp/seal), the pure-CL TLS 1.3 client (system
-  `cl-marmot/wss`; `bin/marmot` loads it when seal and natrium are found, see `MODUS_LISP`). Without it only `ws://`
-  relays work.
 - **Convergence** is linear: the first valid commit for an epoch wins. The spec's same-epoch race resolution,
   rollback horizon and retained-history replay (`protocol-core/convergence.md`) are not implemented.
 - **Encrypted media** (MIP-04 / `encrypted-media-v2`), Blossom images, push notifications, NIP-46 remote signers,
-  message retention expiry tags, disbanding, and agent text streams beyond the receive-role fallback.
+  disbanding, and agent text streams beyond the receive-role fallback.
 - **Constant time.** The bignum elliptic-curve code and table-driven AES are not constant time.
