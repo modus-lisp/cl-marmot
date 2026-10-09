@@ -147,8 +147,9 @@ test/         unit tests, MLS/NIP-44 vectors, wn interop harness
 
 ## Not done yet
 
-- **Convergence** is linear: the first valid commit for an epoch wins. The spec's same-epoch race resolution,
-  rollback horizon and retained-history replay (`protocol-core/convergence.md`) are not implemented.
+- **Convergence** follows the spec's branch selection within the rollback horizon, but not its millisecond
+  collection windows (each sync batch plays that role), retained-history replay beyond the horizon, or disband
+  terminalization.
 - **Encrypted media** (MIP-04 / `encrypted-media-v2`), Blossom images, push notifications, NIP-46 remote signers,
   disbanding, and agent text streams beyond the receive-role fallback.
-- **Constant time** holds where natrium and secp256k1-fast provide it; seal's AES-GCM is table-driven.
+- **Modus**: cl-marmot loads on Modus, but runs far slower there than on SBCL; SBCL is the supported platform.
