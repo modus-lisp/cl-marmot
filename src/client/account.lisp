@@ -135,9 +135,14 @@
               (setf (gethash (mg-id-hex mg) (account-groups acct)) mg)
               (%note mg :type :joined :epoch (mg-epoch mg)
                         :inviter (nostr-event-pubkey rumor))
-              ;; a last-resort KeyPackage stays usable; a single-use one is spent
-              (unless (key-package-last-resort-p (key-package-bundle-key-package (getf entry :bundle)))
-                (setf (account-key-packages acct) (remove entry (account-key-packages acct))))
+              ;; key-packages.md: publish a replacement in the same slot; the
+              ;; consumed init_key is deleted once the replacement is confirmed
+              ;; (a single-use package is spent either way)
+              (let ((replaced (handler-case (progn (publish-key-package acct :d (getf entry :d)) t)
+                                (error (c) (warn "KeyPackage rotation failed: ~A" c) nil))))
+                (when (or replaced
+                          (not (key-package-last-resort-p (key-package-bundle-key-package (getf entry :bundle)))))
+                  (setf (account-key-packages acct) (remove entry (account-key-packages acct)))))
               (when (account-on-event acct)
                 (funcall (account-on-event acct) acct mg (list :type :joined)))
               mg)))))))

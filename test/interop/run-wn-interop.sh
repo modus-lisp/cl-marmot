@@ -73,6 +73,12 @@ check "A carol decrypts in the new epoch" "$("$marmot" messages "$gA")" "after t
 settle
 check "A wn applies carol's self-update" "$(wn --account "$alice" messages list "$gA")" "after my self-update"
 
+# --- A2: the KeyPackage carol rotated after joining is usable -------------
+out=$(wn --json --account "$alice" groups create "second from wn" "$carol" 2>&1)
+gA2=$(printf '%s' "$out" | sed -n 's/.*"group_id":"\([0-9a-f]*\)".*/\1/p')
+settle
+check "A2 carol joins again with her rotated KeyPackage" "$("$marmot" groups)" "$gA2"
+
 # --- B: cl-marmot creates the group, wn joins ------------------------------
 gB=$("$marmot" create "from lisp" "$alice" | sed -n 's/^created //p')
 settle 5
