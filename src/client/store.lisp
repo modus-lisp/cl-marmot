@@ -102,10 +102,48 @@
                              :new-group (sexp->mls-group (getf s :new-group))
                              :invitees (mapcar (lambda (l) (cons (first l) (second l))) (getf s :invitees)))))
 
+(defun %nodes->sexp (mg)
+  "The commit tree: each node with its parent's index; the tip is index 0."
+  (%ensure-tree mg)
+  (let* ((tip (marmot-group-tip mg))
+         (nodes (cons tip (remove tip (marmot-group-nodes mg)))))
+    (loop for n in nodes
+          collect (list :state (mls-group->sexp (cnode-state n))
+                        :digest (cnode-digest n)
+                        :parent (and (cnode-parent n) (position (cnode-parent n) nodes))
+                        :committer (%h (cnode-committer n))
+                        :priority (cnode-priority n)
+                        :senders (cnode-senders n)
+                        :held (cnode-held n)))))
+
+(defun %sexp->nodes (mg s)
+  "Restore the tree; a pre-tree file (:retained, newest first) becomes a linear chain."
+  (let ((entries (getf s :nodes)))
+    (if entries
+        (let ((nodes (mapcar (lambda (e)
+                               (make-cnode :state (sexp->mls-group (getf e :state)) :digest (getf e :digest)
+                                           :committer (%o (getf e :committer)) :priority (getf e :priority)
+                                           :senders (getf e :senders) :held (getf e :held)))
+                             entries)))
+          (loop for e in entries for n in nodes
+                do (let ((p (getf e :parent))) (when p (setf (cnode-parent n) (nth p nodes)))))
+          (setf (marmot-group-nodes mg) nodes
+                (marmot-group-tip mg) (first nodes)
+                (marmot-group-mls mg) (cnode-state (first nodes))))
+        (let ((parent nil))
+          (dolist (st (reverse (getf s :retained)))
+            (let ((n (make-cnode :state (sexp->mls-group st) :parent parent)))
+              (push n (marmot-group-nodes mg))
+              (setf parent n)))
+          (let ((tip (make-cnode :state (marmot-group-mls mg) :parent parent)))
+            (push tip (marmot-group-nodes mg))
+            (setf (marmot-group-tip mg) tip))))
+    mg))
+
 (defun marmot-group->sexp (mg)
   (list :mls (mls-group->sexp (marmot-group-mls mg))
         :pending (%staged->sexp (marmot-group-pending mg))
-        :retained (mapcar #'mls-group->sexp (marmot-group-retained mg))
+        :nodes (%nodes->sexp mg)
         :seen (loop for k being the hash-keys of (marmot-group-seen mg) using (hash-value e) collect (list k e))
         :cursor (marmot-group-cursor mg)
         :deferred (mapcar (lambda (d) (event->json (cdr d))) (marmot-group-deferred mg))
@@ -117,7 +155,7 @@
 (defun sexp->marmot-group (s)
   "MESSAGES in S is the pre-log format; LOAD-ACCOUNT migrates it to the log."
   (let ((mg (make-marmot-group :mls (sexp->mls-group (getf s :mls))
-                               :retained (mapcar #'sexp->mls-group (getf s :retained))
+
                                :messages (getf s :messages)
                                :log (getf s :log)
                                :leaving (getf s :leaving)
@@ -126,6 +164,7 @@
                                                for e = (ignore-errors (json->event j :require-sig t))
                                                when e collect (cons (ev:event-created-at e) e))
                                :pending (%sexp->staged (getf s :pending)))))
+    (%sexp->nodes mg s)
     (dolist (k (getf s :seen))
       (if (consp k)
           (setf (gethash (first k) (marmot-group-seen mg)) (second k))
@@ -247,8 +286,15 @@ file is rewritten only when its contents changed."
             (let ((*package* (find-package '#:cl-marmot)) (*read-eval* nil))
               (loop for entry = (ignore-errors (read in nil :eof))
                     until (or (eq entry :eof) (null entry))
-                    do (let ((mg (gethash (car entry) (account-groups acct))))
-                         (when mg (push (cdr entry) (marmot-group-messages mg))))))))))
+                    do (let ((mg (gethash (car entry) (account-groups acct)))
+                             (plist (cdr entry)))
+                         (when mg
+                           (if (eq (getf plist :type) :invalidate)
+                               ;; a later record withdrawing a message that lost branch selection
+                               (loop for cell on (marmot-group-messages mg)
+                                     when (equal (getf (car cell) :id) (getf plist :id))
+                                       do (setf (car cell) (list* :invalidated t (car cell))))
+                               (push plist (marmot-group-messages mg)))))))))))
     acct))
 
 ;;; ---------------------------------------------------------------------------

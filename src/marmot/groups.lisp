@@ -1,23 +1,34 @@
 ;;;; groups.lisp — Marmot groups over the Nostr transport
 ;;;;
 ;;;; A MARMOT-GROUP wraps the canonical MLS-GROUP plus what Marmot reads out of
-;;;; its GroupContext (admins, routing, profile) and the small amount of
-;;;; transport state needed to receive: retained prior epochs (for trial
-;;;; decryption of late kind 445 envelopes) and the set of MLS message ids
-;;;; already processed (dedup across relays).
-;;;;
-;;;; Convergence (protocol-core/convergence.md) is implemented in its simplest
-;;;; linear form: the first valid commit for the current epoch wins and the
-;;;; prior epoch is retained.  Same-epoch races are reported, not resolved.
+;;;; its GroupContext (admins, routing, profile) and the transport state needed
+;;;; to receive: a tree of retained group states (the canonical path and any
+;;;; competing branches, see convergence.lisp), the set of MLS message ids
+;;;; already processed (dedup across relays), a fetch cursor and a queue of
+;;;; events that do not decrypt yet.
 
 (in-package #:cl-marmot)
 
-(defparameter *retained-epochs* 4
-  "How many prior epochs to keep for decrypting late application messages.")
+(defparameter *max-rewind-commits* 5
+  "Convergence policy v1 max_rewind_commits: how far back a competing branch may
+fork and still win; also how many prior states are kept for late messages.")
+
+(defstruct cnode
+  "One retained group state in a chat's commit tree (protocol-core/convergence.md)."
+  state                   ; the MLS-GROUP after this node's commit
+  digest                  ; hex SHA-256 of the commit's MLSMessage bytes (NIL for the anchor)
+  parent                  ; CNODE, or NIL for the oldest retained state
+  committer               ; account (octets) that authored the commit
+  (priority :ordinary)    ; :privileged when its authorization required an active admin
+  (senders '())           ; hex accounts whose app payloads decrypted at this node (witnesses)
+  (held '()))             ; app messages decrypted here while the node was not canonical
+
+(defun cnode-epoch (n) (mls-group-epoch (cnode-state n)))
 
 (defstruct marmot-group
-  mls                     ; canonical MLS-GROUP
-  (retained '())          ; prior MLS-GROUPs, newest first
+  mls                     ; canonical MLS-GROUP: the state of TIP
+  (nodes '())             ; every retained CNODE (canonical path and competing branches)
+  tip                     ; the canonical CNODE
   (seen (make-hash-table :test #'equal))   ; MLS message-id hex -> epoch it was seen in
   (cursor 0)              ; created_at high-water mark of kind 445 events fetched
   (deferred '())          ; kind 445 events not yet decryptable: list of (created-at . event)
@@ -190,115 +201,96 @@ candidate parent MLS."
 ;;; ---------------------------------------------------------------------------
 ;;; Receiving
 
-(defun %retain (mg old)
-  (push old (marmot-group-retained mg))
-  (when (> (length (marmot-group-retained mg)) *retained-epochs*)
-    (setf (marmot-group-retained mg) (subseq (marmot-group-retained mg) 0 *retained-epochs*))))
-
 (defun %note (mg &rest plist)
   (push plist (marmot-group-log mg))
   plist)
 
-(defun %apply-new-epoch (mg new &key commit committer)
-  "Make NEW canonical after Marmot validation; returns notifications."
-  (let ((old (marmot-group-mls mg)))
-    (if (mls-group-active new)
-        (validate-marmot-group-state new)
-        (progn (%retain mg old)
-               (setf (marmot-group-mls mg) new)
-               (return-from %apply-new-epoch
-                 (list (%note mg :type :removed :epoch (mls-group-epoch old))))))
-    (let ((before (group-member-accounts old))
-          (after (group-member-accounts new))
-          (notes '()))
-      (%retain mg old)
-      (setf (marmot-group-mls mg) new)
-      (dolist (a after)
-        (unless (member a before :test #'octets=)
-          (push (%note mg :type :member-added :account a :epoch (mls-group-epoch new)) notes)))
-      (dolist (a before)
-        (unless (member a after :test #'octets=)
-          (push (%note mg :type :member-removed :account a :epoch (mls-group-epoch new)) notes)))
-      (unless (equalp (multiple-value-list (group-profile old)) (multiple-value-list (group-profile new)))
-        (push (%note mg :type :renamed :name (group-profile new)) notes))
-      (push (%note mg :type :epoch :epoch (mls-group-epoch new) :committer committer
-                      :commit (and commit t))
-            notes)
-      (nreverse notes))))
+(defun %state-notes (mg old new &key committer digest)
+  "State notifications for the canonical change OLD -> NEW (recorded in the log)."
+  (if (not (mls-group-active new))
+      (list (%note mg :type :removed :epoch (mls-group-epoch old)))
+      (let ((before (group-member-accounts old))
+            (after (group-member-accounts new))
+            (notes '()))
+        (dolist (a after)
+          (unless (member a before :test #'octets=)
+            (push (%note mg :type :member-added :account a :epoch (mls-group-epoch new) :commit digest) notes)))
+        (dolist (a before)
+          (unless (member a after :test #'octets=)
+            (push (%note mg :type :member-removed :account a :epoch (mls-group-epoch new) :commit digest) notes)))
+        (unless (equalp (multiple-value-list (group-profile old)) (multiple-value-list (group-profile new)))
+          (push (%note mg :type :renamed :name (group-profile new) :commit digest) notes))
+        (push (%note mg :type :epoch :epoch (mls-group-epoch new)
+                        :committer (and committer (octets->hex committer)) :commit digest)
+              notes)
+        (nreverse notes))))
 
 (defun receive-group-event (mg ev)
   "Process a verified kind 445 event.  Returns a list of results (plists):
-(:type :message ...), state notifications, (:type :duplicate) or
-(:type :undecryptable)."
+(:type :message ...), state notifications, or :duplicate / :undecryptable /
+:rejected / :held markers.  Commits become candidate edges of the chat's
+commit tree and convergence decides which branch is canonical."
   (%validate-445-shape ev)
-  (let* ((candidates (cons (marmot-group-mls mg) (marmot-group-retained mg)))
-         (state nil)
-         (bytes (loop for c in candidates
-                      for b = (open-group-message c ev)
-                      when b do (setf state c) (return b))))
+  (%ensure-tree mg)
+  (let* ((node nil)
+         (bytes (loop for n in (%candidate-nodes mg)
+                      for b = (open-group-message (cnode-state n) ev)
+                      when b do (setf node n) (return b))))
     (unless bytes (return-from receive-group-event (list (list :type :undecryptable))))
-    (let ((mid (octets->hex (sha256 bytes))))
+    (let ((mid (octets->hex (sha256 bytes)))
+          (state (cnode-state node)))
       (when (gethash mid (marmot-group-seen mg)) (return-from receive-group-event (list (list :type :duplicate))))
-      (setf (gethash mid (marmot-group-seen mg)) (mg-epoch mg))
+      (setf (gethash mid (marmot-group-seen mg)) (cnode-epoch node))
       (let ((msg (tls-deserialize 'mls-message bytes)))
-        (cond
-          ;; our own pending commit coming back
-          ((and (marmot-group-pending mg)
-                (octets= bytes (staged-commit-message (marmot-group-pending mg))))
-           ;; a relay has our pending commit: it was published, so it is canonical
-           (let ((staged (marmot-group-pending mg)))
-             (append (merge-pending mg) (list (list :type :own-commit-merged :staged staged)))))
-          ((/= (mls-message-wire-format msg) +wf-private-message+)
-           ;; handshake: only against the canonical state
-           (unless (eq state (marmot-group-mls mg))
-             (return-from receive-group-event (list (list :type :stale))))
-           (let ((r (handler-case (process-message state bytes)
-                      (mls-error (c) (return-from receive-group-event
-                                       (list (list :type :rejected :reason (mls-error-message c))))))))
-             (ecase (getf r :type)
-               (:proposal
-                (let ((why (proposal-authorization-error state (getf r :proposal) (getf r :sender))))
-                  (if why
-                      (progn (setf (mls-group-proposals state)
-                                   (remove (getf r :ref) (mls-group-proposals state)
-                                           :key (lambda (x) (getf x :ref)) :test #'octets=))
-                             (list (list :type :rejected :reason why)))
-                      (list (list :type :proposal :sender (getf r :sender)
-                                  :proposal-type (proposal-type (getf r :proposal)))))))
-               (:commit
-                (let ((why (commit-authorization-error
-                            state (getf r :sender)
-                            (%resolve-proposals state (getf r :commit) (getf r :sender)))))
-                  (if why
-                      (list (list :type :rejected :reason why))
-                      (handler-case (append (%apply-new-epoch mg (getf r :new-group)
-                                                              :commit (getf r :commit)
-                                                              :committer (getf r :sender))
-                                            (%drop-superseded-pending mg))
-                        (marmot-error (c)
-                          (list (list :type :rejected :reason (marmot-error-message c)))))))))))
-          (t
-           (let ((r (handler-case (process-message state bytes)
-                      (mls-error (c) (return-from receive-group-event
-                                       (list (list :type :rejected :reason (mls-error-message c))))))))
-             (case (getf r :type)
-               (:application
-                (let* ((leaf (getf r :sender-leaf))
-                       (app (handler-case (decode-app-event (getf r :data))
-                              (error (c) (return-from receive-group-event
-                                           (list (list :type :rejected :reason (format nil "app payload: ~A" c))))))))
-                  (if (string= (ev:event-pubkey app) (octets->hex (leaf-account leaf)))
-                      (let ((m (list :type :message :epoch (mls-group-epoch state)
-                                     :sender (ev:event-pubkey app)
-                                     :kind (ev:event-kind app) :content (ev:event-content app)
-                                     :tags (ev:event-tags app) :id (ev:event-id app)
-                                     :created-at (ev:event-created-at app))))
-                        (push m (marmot-group-messages mg))
-                        (list m))
-                      (list (list :type :rejected :reason "app event pubkey is not the MLS sender")))))
-               (:proposal (list (list :type :proposal :sender (getf r :sender))))
-               (:commit (handler-case (%apply-new-epoch mg (getf r :new-group) :committer (getf r :sender))
-                          (marmot-error (c) (list (list :type :rejected :reason (marmot-error-message c))))))))))))))
+        (flet ((reject (why) (return-from receive-group-event (list (list :type :rejected :reason why)))))
+          (cond
+            ;; our own pending commit coming back: it was published
+            ((and (marmot-group-pending mg)
+                  (octets= bytes (staged-commit-message (marmot-group-pending mg))))
+             (let ((staged (marmot-group-pending mg)))
+               (append (merge-pending mg) (list (list :type :own-commit-merged :staged staged)))))
+            ((/= (mls-message-wire-format msg) +wf-private-message+)
+             (let ((r (handler-case (process-message state bytes)
+                        (mls-error (c) (reject (mls-error-message c))))))
+               (ecase (getf r :type)
+                 (:proposal
+                  (let ((why (proposal-authorization-error state (getf r :proposal) (getf r :sender))))
+                    (when why
+                      (setf (mls-group-proposals state)
+                            (remove (getf r :ref) (mls-group-proposals state)
+                                    :key (lambda (x) (getf x :ref)) :test #'octets=))
+                      (reject why))
+                    (list (list :type :proposal :sender (getf r :sender)
+                                :proposal-type (proposal-type (getf r :proposal))))))
+                 (:commit
+                  (let ((why (admit-commit mg node r mid)))
+                    (if why (reject why) (converge mg)))))))
+            (t
+             (let ((r (handler-case (process-message state bytes)
+                        (mls-error (c) (reject (mls-error-message c))))))
+               (case (getf r :type)
+                 (:application
+                  (let* ((leaf (getf r :sender-leaf))
+                         (app (handler-case (decode-app-event (getf r :data))
+                                (error (c) (reject (format nil "app payload: ~A" c))))))
+                    (unless (string= (ev:event-pubkey app) (octets->hex (leaf-account leaf)))
+                      (reject "app event pubkey is not the MLS sender"))
+                    (let ((m (list :type :message :epoch (mls-group-epoch state)
+                                   :sender (ev:event-pubkey app)
+                                   :kind (ev:event-kind app) :content (ev:event-content app)
+                                   :tags (ev:event-tags app) :id (ev:event-id app)
+                                   :created-at (ev:event-created-at app) :node (cnode-digest node))))
+                      (pushnew (ev:event-pubkey app) (cnode-senders node) :test #'string=)
+                      (if (%canonical-p mg node)
+                          (progn (push m (marmot-group-messages mg))
+                                 ;; a witness can change which branch wins
+                                 (cons m (converge mg)))
+                          (progn (push m (cnode-held node))
+                                 (cons (list :type :held :epoch (mls-group-epoch state)) (converge mg)))))))
+                 (:proposal (list (list :type :proposal :sender (getf r :sender))))
+                 (:commit
+                  (let ((why (admit-commit mg node r mid)))
+                    (if why (reject why) (converge mg)))))))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Joining (protocol-core/joining.md)
@@ -388,21 +380,25 @@ the STAGED-COMMIT.  Marmot authorization is checked against the current state."
     (setf (marmot-group-pending mg) staged)))
 
 (defun merge-pending (mg)
-  "Publication succeeded: the staged commit becomes canonical."
+  "Publication succeeded: our staged commit becomes a candidate edge from the
+tip it was built on, and convergence (normally linear) makes it canonical."
   (let ((staged (marmot-group-pending mg)))
     (unless staged (marmot-fail "nothing pending"))
-    (setf (gethash (octets->hex (sha256 (staged-commit-message staged))) (marmot-group-seen mg)) (mg-epoch mg))
-    (setf (marmot-group-pending mg) nil)
-    (%apply-new-epoch mg (staged-commit-new-group staged) :committer (mls-group-own-leaf (marmot-group-mls mg)))))
+    (%ensure-tree mg)
+    (let ((mid (octets->hex (sha256 (staged-commit-message staged)))))
+      (setf (gethash mid (marmot-group-seen mg)) (mg-epoch mg))
+      (setf (marmot-group-pending mg) nil)
+      (admit-own-commit mg staged mid)
+      (converge mg))))
 
 (defun discard-pending (mg) (setf (marmot-group-pending mg) nil))
 
 (defun %drop-superseded-pending (mg)
-  "Another member's commit took the epoch our pending commit was built for:
-ours can never apply.  Returns a notification, or NIL."
+  "Our pending commit was built on a state that is no longer the tip: it can
+never apply.  Returns a notification, or NIL."
   (let ((staged (marmot-group-pending mg)))
     (when (and staged
-               (<= (mls-group-epoch (staged-commit-new-group staged)) (mg-epoch mg)))
+               (not (eq (mls-group-epoch (staged-commit-new-group staged)) (1+ (mg-epoch mg)))))
       (setf (marmot-group-pending mg) nil)
       (list (%note mg :type :pending-superseded :epoch (mg-epoch mg)
                       :invitees (mapcar #'car (staged-commit-invitees staged)))))))
@@ -461,7 +457,7 @@ leaving leaf: the one with the lowest proposal digest."
 (defun prune-marmot-group (mg)
   "Forget dedup ids from epochs too old to decrypt anyway, and give up on
 deferred events older than a week."
-  (let ((floor (- (mg-epoch mg) *retained-epochs* 2))
+  (let ((floor (- (mg-epoch mg) *max-rewind-commits* 2))
         (seen (marmot-group-seen mg)))
     (loop for k being the hash-keys of seen using (hash-value e)
           when (and (integerp e) (< e floor)) do (remhash k seen))

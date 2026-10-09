@@ -38,7 +38,8 @@
       :serial t
       :components ((:file "components")
                    (:file "key-packages")
-                   (:file "groups")))
+                   (:file "groups")
+                   (:file "convergence")))
      (:module "client"
       :serial t
       :components ((:file "account")
@@ -59,4 +60,5 @@
                  (:file "mls-vector-tests")
                  (:file "nostr-tests")
                  (:file "marmot-tests")
-                 (:file "group-tests")))))
+                 (:file "group-tests")
+                 (:file "convergence-tests")))))

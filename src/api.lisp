@@ -31,7 +31,7 @@
    #:chat-epoch #:chat-active-p #:chat-leaving-p #:chat-messages
    ;; messages
    #:message #:message-id #:message-chat-id #:message-sender #:message-kind #:message-content
-   #:message-tags #:message-created-at #:message-epoch #:message-own-p
+   #:message-tags #:message-created-at #:message-epoch #:message-own-p #:message-invalidated-p
    ;; actions
    #:create-chat #:send #:invite #:remove-members #:rename #:promote #:demote #:leave #:self-update
    ;; sync and events
@@ -162,17 +162,23 @@ KeyPackage to RELAYS.  NSEC imports an existing key.  Returns an open CLIENT."
 ;;; Messages
 
 (defstruct (message (:constructor %make-message))
-  id chat-id sender kind content tags created-at epoch own-p)
+  id chat-id sender kind content tags created-at epoch own-p
+  invalidated-p)          ; it was delivered on a branch that later lost convergence
 
 (defun %message (chat plist)
   (%make-message :id (getf plist :id) :chat-id (chat-id chat) :sender (getf plist :sender)
                  :kind (getf plist :kind) :content (getf plist :content) :tags (getf plist :tags)
                  :created-at (getf plist :created-at) :epoch (getf plist :epoch)
-                 :own-p (and (getf plist :own) t)))
+                 :own-p (and (getf plist :own) t)
+                 :invalidated-p (and (getf plist :invalidated) t)))
 
-(defun chat-messages (chat &key limit)
-  "Delivered messages, oldest first (the newest LIMIT if given)."
-  (let ((all (cl-marmot::marmot-group-messages chat)))
+(defun chat-messages (chat &key limit include-invalidated)
+  "Delivered messages, oldest first (the newest LIMIT if given).  Messages
+withdrawn because their branch lost convergence are left out unless
+INCLUDE-INVALIDATED."
+  (let ((all (if include-invalidated
+                 (cl-marmot::marmot-group-messages chat)
+                 (remove-if (lambda (p) (getf p :invalidated)) (cl-marmot::marmot-group-messages chat)))))
     (mapcar (lambda (p) (%message chat p))
             (reverse (if limit (subseq all 0 (min limit (length all))) all)))))
 
@@ -182,6 +188,8 @@ KeyPackage to RELAYS.  NSEC imports an existing key.  Returns an open CLIENT."
 (defstruct (event (:constructor %make-event))
   type          ; :message :joined :member-added :member-removed :renamed :removed :epoch :rejected
                 ; :pending-superseded (another member's commit took the epoch ours was for)
+                ; :commit-invalidated, :message-invalidated (they were on a branch that lost
+                ;   convergence; the changes they announced did not happen)
   chat          ; the chat object
   message       ; a MESSAGE, for :message
   account       ; hex pubkey, for :member-added / :member-removed
@@ -189,7 +197,7 @@ KeyPackage to RELAYS.  NSEC imports an existing key.  Returns an open CLIENT."
 
 (defun %event (chat r)
   (let ((type (getf r :type)))
-    (unless (member type '(:duplicate :undecryptable :stale :own-commit-merged :proposal))
+    (unless (member type '(:duplicate :undecryptable :stale :own-commit-merged :proposal :held))
       (%make-event :type type :chat chat
                    :message (and (eq type :message) (%message chat r))
                    :account (let ((a (getf r :account))) (and a (cl-marmot::octets->hex a)))
