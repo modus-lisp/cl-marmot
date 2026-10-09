@@ -31,8 +31,8 @@
       (is (not (verify-event round))))))
 
 (defun nip44-vectors ()
-  (let ((path "/home/claude/marmot-ref/nip44.vectors.json"))
-    (when (probe-file path)
+  (let ((path (require-vector-file "nip44.vectors.json")))
+    (when path
       (with-open-file (in path :external-format :utf-8)
         (let* ((text (make-string (file-length in)))
                (n (read-sequence text in)))

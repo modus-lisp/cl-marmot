@@ -91,10 +91,17 @@
     (null *failures*)))
 
 (defun vector-path (name)
-  "Path to an external test-vector file.  CL_MARMOT_VECTORS overrides the default."
+  "test/vectors/NAME (fetched by test/fetch-vectors.sh); CL_MARMOT_VECTORS overrides the directory."
   (let ((dir (or (cl-marmot::getenv "CL_MARMOT_VECTORS")
-                 "/home/claude/marmot-ref/mls-implementations/test-vectors/")))
-    (concatenate 'string dir name)))
+                 (concatenate 'string (string-right-trim "/" (namestring (merge-pathnames "../" (fixture-dir)))) "/vectors/"))))
+    (concatenate 'string (string-right-trim "/" dir) "/" name)))
+
+(defun require-vector-file (name)
+  "The path of vector file NAME; a missing file is a test FAILURE, never a skip."
+  (let ((path (vector-path name)))
+    (unless (probe-file path)
+      (note-failure "missing ~A: run test/fetch-vectors.sh" path))
+    (and (probe-file path) path)))
 
 (defun fixture-dir ()
   "test/fixtures/ of this checkout: CL_MARMOT_ROOT, else ASDF's idea of the

@@ -8,14 +8,14 @@
 (in-package #:cl-marmot/test)
 
 (defun load-vectors (name)
-  (let ((path (vector-path name)))
-    (if (probe-file path)
+  (let ((path (require-vector-file name)))
+    (if path
         (with-open-file (in path :external-format :utf-8)
           (let ((text (make-string (file-length in))))
             (let ((n (read-sequence text in)))
               (remove-if-not (lambda (v) (or (not (jobj-p v)) (eql (jget v "cipher_suite" 1) 1)))
                              (coerce (parse-json (subseq text 0 n)) 'list)))))
-        (progn (format t "~&;; missing vector file ~A~%" path) '()))))
+        '())))
 
 (defun jhex (obj key)
   (let ((v (jget obj key)))

@@ -2,6 +2,8 @@
 
 (asdf:defsystem #:cl-marmot
   :description "A Marmot protocol client: MLS (RFC 9420) group messaging over Nostr, in portable Common Lisp."
+  :version "0.9.0"
+  :author "ynniv"
   :license "MIT"
   :depends-on (#:natrium #:secp256k1-fast #:seal #:cl-nostr #:bordeaux-threads)
   :serial t
@@ -45,6 +47,7 @@
      (:file "cli")))))
 
 (asdf:defsystem #:cl-marmot/test
+  :description "cl-marmot's tests.  Run test/fetch-vectors.sh first."
   :depends-on (#:cl-marmot)
   :serial t
   :components

@@ -42,9 +42,13 @@ primitive, run through cl-marmot's crypto bridge against the libraries above (FI
 McGrew–Viega GCM, all 19 BIP-340 rows), and the NIP-44 v2 vectors run against cl-nostr.
 
 ```
+test/fetch-vectors.sh          # the MLS WG and NIP-44 vectors, pinned and checksummed
 ./run-tests.sh                 # 52 tests, 10,947 checks
 WN_BIN=/path/to/wn-dir test/interop/run-wn-interop.sh
 ```
+
+The external vectors are fetched rather than vendored (their repositories declare no licence); a missing vector
+file fails the suite rather than skipping it.
 
 ## Lisp API
 
