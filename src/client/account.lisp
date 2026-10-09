@@ -20,6 +20,7 @@
   (outbox '())                         ; Welcome deliveries still owed (plists), see QUEUE-WELCOMES
   (unsaved-messages '())               ; (group-id-hex . message-plist), newest first, for the log
   (last-saved nil)                     ; the account text last written (to skip unchanged saves)
+  (last-kp-check 0)                    ; when KeyPackage upkeep last ran (in-memory)
   (checkpoint nil)                     ; (lambda ()) that saves the account; called before publishing
   (on-event nil))                      ; (lambda (account group result)) for UIs
 
@@ -109,6 +110,43 @@ setup (tests, development) never touches public infrastructure.")
   (publish-relay-lists acct)
   (when name (publish-profile acct name))
   (publish-key-package acct))
+
+;;; KeyPackage upkeep (foundation/key-packages.md "Selection and lifecycle")
+
+(defparameter *kp-refresh-window* (* 7 24 3600)
+  "Publish a replacement when no KeyPackage of ours is valid this much longer.")
+
+(defun %kp-not-after (entry)
+  (lifetime-not-after (leaf-node-lifetime (key-package-leaf-node
+                                           (key-package-bundle-key-package (getf entry :bundle))))))
+
+(defun key-package-plan (acct now)
+  "Returns (values expired-entries refresh-needed-p slot): entries past their
+lifetime (their private keys must go), whether a fresh KeyPackage is due, and
+the publication slot (d) to reuse for it."
+  (let* ((entries (account-key-packages acct))
+         (expired (remove-if-not (lambda (e) (< (%kp-not-after e) now)) entries))
+         (live (set-difference entries expired))
+         (newest (first (sort (copy-list entries) #'> :key #'%kp-not-after))))
+    (values expired
+            (notany (lambda (e) (> (%kp-not-after e) (+ now *kp-refresh-window*))) live)
+            (and newest (getf newest :d)))))
+
+(defun maintain-key-packages (acct &key (now (unix-time)) force)
+  "At most hourly (or when FORCE): delete expired KeyPackage keys and publish a
+replacement when ours are about to run out.  After a replacement is
+confirmed, older KeyPackages in that slot are dropped with their keys."
+  (when (or force (> now (+ (account-last-kp-check acct) 3600)))
+    (setf (account-last-kp-check acct) now)
+    (multiple-value-bind (expired refresh slot) (key-package-plan acct now)
+      (setf (account-key-packages acct) (set-difference (account-key-packages acct) expired))
+      (when refresh
+        (let* ((old (remove-if-not (lambda (e) (and slot (octets= (getf e :d) slot))) (account-key-packages acct)))
+               (new (handler-case (publish-key-package acct :d (or slot (random-octets 32)))
+                      (error (c) (warn "KeyPackage refresh failed: ~A" c) nil))))
+          (when new
+            (setf (account-key-packages acct) (set-difference (account-key-packages acct) old))
+            (%checkpoint acct)))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Directory lookups
@@ -280,6 +318,7 @@ results produced."
     (setf (account-last-sync acct) (unix-time))
     (retry-pending-commits acct)
     (flush-outbox acct)
+    (maintain-key-packages acct)
     (dolist (wrap (pool-query acct (account-relays acct)
                               (list (flt:make-filter :kinds '(1059) :tags (list (cons "p" (list (account-pubkey-hex acct))))
                                                      :since since))))

@@ -59,3 +59,24 @@
     (is-equal "name" n) (is-equal "desc" d))
   (is-equal :active (decode-lifecycle (encode-lifecycle :active)))
   (signals marmot-error (decode-lifecycle (octets 0 0))))
+
+(deftest key-package-upkeep-plan ()
+  (let* ((sk (generate-nostr-key))
+         (acct (make-account-from-secret sk :relays '("ws://127.0.0.1:1")))
+         (now 1800000000)
+         (slot (random-octets 32))
+         (entry (lambda (made-at)
+                  (list :bundle (make-marmot-key-package sk :now made-at) :event-id "00" :ref "00" :d slot))))
+    ;; nothing published: a KeyPackage is due
+    (multiple-value-bind (expired refresh) (key-package-plan acct now)
+      (is (null expired)) (is refresh "an account with no KeyPackage needs one"))
+    ;; a fresh one (84 days left): nothing to do
+    (setf (cl-marmot::account-key-packages acct) (list (funcall entry now)))
+    (multiple-value-bind (expired refresh) (key-package-plan acct now)
+      (is (null expired)) (is (not refresh)))
+    ;; 80 days later: four days left, inside the 7-day window: refresh, same slot
+    (multiple-value-bind (expired refresh d) (key-package-plan acct (+ now (* 80 24 3600)))
+      (is (null expired)) (is refresh) (is (octets= d slot) "the replacement reuses the slot"))
+    ;; 90 days later: expired, its keys must go, and a new one is due
+    (multiple-value-bind (expired refresh) (key-package-plan acct (+ now (* 90 24 3600)))
+      (is-equal 1 (length expired)) (is refresh))))
