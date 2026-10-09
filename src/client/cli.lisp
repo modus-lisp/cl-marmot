@@ -74,6 +74,8 @@
   marmot send GROUP TEXT...          marmot messages GROUP [N]
   marmot members GROUP               marmot rename GROUP NAME
   marmot remove GROUP NPUB...        marmot self-update GROUP
+  marmot promote GROUP NPUB          marmot demote GROUP NPUB
+  marmot leave GROUP
 GROUP is a group id, a unique id prefix, or a group name.
 State: $MARMOT_HOME/account.sexp (default ~/.local/share/cl-marmot/)
 ")
@@ -124,8 +126,12 @@ State: $MARMOT_HOME/account.sexp (default ~/.local/share/cl-marmot/)
       ((string= cmd "groups")
        (sync acct)
        (loop for mg being the hash-values of (account-groups acct)
-             do (%out "~A  epoch ~3D  ~2D members  ~A~%" (mg-id-hex mg) (mg-epoch mg)
-                      (length (mls-group-members (marmot-group-mls mg))) (mg-name mg))))
+             do (%out "~A  epoch ~3D  ~2D members  ~8A  ~A~%" (mg-id-hex mg) (mg-epoch mg)
+                      (length (mls-group-members (marmot-group-mls mg)))
+                      (cond ((not (mls-group-active (marmot-group-mls mg))) "removed")
+                            ((marmot-group-leaving mg) "leaving")
+                            (t "active"))
+                      (mg-name mg))))
       ((string= cmd "create")
        (let ((mg (create-group-with acct (first args) (rest args))))
          (%out "created ~A~%" (mg-id-hex mg))))
@@ -133,6 +139,9 @@ State: $MARMOT_HOME/account.sexp (default ~/.local/share/cl-marmot/)
       ((string= cmd "remove") (sync acct) (remove-members acct (group) (rest args)) (%out "removed~%"))
       ((string= cmd "rename") (sync acct) (rename-group acct (group) (format nil "~{~A~^ ~}" (rest args)))
        (%out "renamed~%"))
+      ((string= cmd "promote") (sync acct) (promote acct (group) (second args)) (%out "promoted~%"))
+      ((string= cmd "demote") (sync acct) (demote acct (group) (second args)) (%out "demoted~%"))
+      ((string= cmd "leave") (sync acct) (leave-group acct (group)) (%out "leave requested~%"))
       ((string= cmd "self-update") (sync acct) (self-update acct (group)) (%out "epoch ~D~%" (mg-epoch (group))))
       ((string= cmd "send")
        (sync acct)

@@ -765,8 +765,10 @@ G's secret tree (consumes a generation)."
          (pm (make-public-message :content fc :auth auth
                                   :membership-tag (membership-tag (epoch-secrets-membership-key (mls-group-secrets g))
                                                                   +wf-public-message+ fc auth gc))))
-    (values (mls-message-octets +wf-public-message+ pm)
-            (make-proposal-ref (authenticated-content-octets +wf-public-message+ fc auth)))))
+    (let ((octets (mls-message-octets +wf-public-message+ pm)))
+      ;; the proposer retains its own proposal, so a commit can reference it
+      (%store-proposal g fc auth +wf-public-message+ octets)
+      (values octets (make-proposal-ref (authenticated-content-octets +wf-public-message+ fc auth))))))
 
 (defun process-message (g message-octets)
   "Process one MLSMessage addressed to group G.  Returns a plist:
@@ -794,7 +796,7 @@ G's secret tree (consumes a generation)."
                (1 (list :type :application :sender sender :sender-leaf leaf
                         :data (framed-content-application-data fc)
                         :authenticated-data (framed-content-authenticated-data fc)))
-               (2 (%store-proposal g fc auth +wf-private-message+))
+               (2 (%store-proposal g fc auth +wf-private-message+ message-octets))
                (3 (list :type :commit :sender sender :commit (framed-content-commit fc)
                         :new-group (process-commit-content g fc auth +wf-private-message+))))))))
       ((= wf +wf-public-message+)
@@ -802,17 +804,18 @@ G's secret tree (consumes a generation)."
               (fc (public-message-content pm)))
          (case (framed-content-content-type fc)
            (2 (%verify-public-message g pm)
-            (%store-proposal g fc (public-message-auth pm) +wf-public-message+))
+            (%store-proposal g fc (public-message-auth pm) +wf-public-message+ message-octets))
            (3 (list :type :commit :sender (sender-index (framed-content-sender fc))
                     :commit (framed-content-commit fc)
                     :new-group (process-commit g pm)))
            (t (mls-fail "application data in a PublicMessage")))))
       (t (mls-fail "unexpected wire format ~D for a group message" wf)))))
 
-(defun %store-proposal (g fc auth wire-format)
+(defun %store-proposal (g fc auth wire-format &optional message-octets)
   (let* ((ref (make-proposal-ref (authenticated-content-octets wire-format fc auth)))
          (entry (list :ref ref :proposal (framed-content-proposal fc)
-                      :sender (sender-index (framed-content-sender fc)))))
+                      :sender (sender-index (framed-content-sender fc))
+                      :digest (and message-octets (sha256 message-octets)))))
     (unless (find ref (mls-group-proposals g) :key (lambda (x) (getf x :ref)) :test #'octets=)
       (setf (mls-group-proposals g) (append (mls-group-proposals g) (list entry))))
     (list* :type :proposal entry)))

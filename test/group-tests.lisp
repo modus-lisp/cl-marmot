@@ -102,3 +102,33 @@
     (is (null (marmot-group-pending a)))
     (stage-commit a :proposals (add-proposals-for (list (key-package-bundle-key-package bob-kp))))
     (is (marmot-group-pending a))))
+
+(deftest marmot-self-remove-and-authorization ()
+  (let* ((alice-sk (generate-nostr-key)) (bob-sk (generate-nostr-key))
+         (bob-pk (secp256k1-xonly-pubkey bob-sk))
+         (bob-kp (make-marmot-key-package bob-sk))
+         (a (create-marmot-group alice-sk :name "t" :relays '("ws://127.0.0.1:1")))
+         (staged (stage-commit a :proposals (add-proposals-for (list (key-package-bundle-key-package bob-kp))))))
+    (merge-pending a)
+    (let ((b (join-marmot-group (mls-message-body (tls-deserialize 'mls-message (staged-commit-welcome staged)))
+                                bob-kp)))
+      ;; a non-admin may not rename, add or remove
+      (signals marmot-error
+               (stage-commit b :proposals (list (make-proposal :type +prop-app-data-update+ :component-id +c-profile+
+                                                               :operation 1 :data (encode-group-profile "x" "")))))
+      (is (null (marmot-group-pending b)))
+      ;; an admin may not SelfRemove
+      (signals marmot-error (self-remove-message a))
+      ;; bob leaves: proposal -> alice commits it by reference -> bob is out
+      (let ((ev (self-remove-message b)))
+        (setf (marmot-group-leaving b) t)
+        (is-equal :proposal (getf (first (%deliver a ev)) :type)))
+      (signals marmot-error (send-app-message b bob-pk 9 "while leaving"))
+      (let ((removes (pending-self-removes a)))
+        (is-equal 1 (length removes))
+        (stage-commit a :by-reference removes)
+        (let ((env (%commit-envelope a)))
+          (merge-pending a)
+          (is-equal :removed (getf (first (%deliver b env)) :type))))
+      (is-equal 1 (length (mls-group-members (marmot-group-mls a))))
+      (is (null (pending-self-removes a)) "consumed proposals are gone in the new epoch"))))

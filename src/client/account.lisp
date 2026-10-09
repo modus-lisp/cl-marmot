@@ -201,6 +201,7 @@ results produced."
                                 (setf progress t)
                                 (setf results (append results r)))))))
                (unless progress (return))))
+    (commit-pending-self-removes acct)
     results))
 
 ;;; ---------------------------------------------------------------------------
@@ -288,3 +289,49 @@ acknowledgement, discard otherwise.  Returns the relay results."
   (let ((ev (send-app-message mg (account-pubkey acct) kind text :tags tags)))
     (setf (gethash (nostr-event-id ev) (account-seen-group-events acct)) t)
     (%publish acct (mg-relays mg) ev)))
+
+;;; ---------------------------------------------------------------------------
+;;; Admin policy and departure
+
+(defun set-admins (acct mg admins)
+  "Commit a full admin-policy replacement (promote / demote)."
+  (stage-commit mg :proposals (list (make-proposal :type +prop-app-data-update+ :component-id +c-admin-policy+
+                                                   :operation 1 :data (encode-admin-policy admins))))
+  (publish-commit acct mg))
+
+(defun promote (acct mg pubkey)
+  (let ((pk (parse-pubkey pubkey)) (mls (marmot-group-mls mg)))
+    (unless (member pk (group-member-accounts mls) :test #'octets=) (marmot-fail "not a member"))
+    (set-admins acct mg (cons pk (group-admins mls)))))
+
+(defun demote (acct mg pubkey)
+  (let* ((pk (parse-pubkey pubkey))
+         (rest (remove pk (group-admins (marmot-group-mls mg)) :test #'octets=)))
+    (unless rest (marmot-fail "the group must keep at least one admin"))
+    (set-admins acct mg rest)))
+
+(defun leave-group (acct mg)
+  "member-departure.md: an admin first leaves the admin list (needs another
+admin), then publishes a SelfRemove proposal for a remaining member to commit."
+  (let ((mls (marmot-group-mls mg)))
+    (when (active-admin-p mls (account-pubkey acct))
+      (let ((others (remove (account-pubkey acct) (group-admins mls) :test #'octets=)))
+        (unless others (marmot-fail "you are the only admin: promote someone first"))
+        (set-admins acct mg others)))
+    (let ((ev (self-remove-message mg)))
+      (setf (gethash (nostr-event-id ev) (account-seen-group-events acct)) t)
+      (%publish acct (mg-relays mg) ev)
+      (setf (marmot-group-leaving mg) t))))
+
+(defun commit-pending-self-removes (acct)
+  "Commit retained peer SelfRemove proposals (one SelfRemove-only commit per
+group).  Returns the groups advanced."
+  (loop for mg being the hash-values of (account-groups acct)
+        for removes = (and (mls-group-active (marmot-group-mls mg))
+                           (not (marmot-group-leaving mg))
+                           (pending-self-removes mg))
+        when removes
+          collect (handler-case (progn (stage-commit mg :by-reference removes)
+                                       (publish-commit acct mg)
+                                       mg)
+                    (error (c) (discard-pending mg) (warn "SelfRemove commit: ~A" c) nil))))

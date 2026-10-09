@@ -58,7 +58,7 @@
         :confirmation-tag (%h (mls-group-confirmation-tag g))
         :proposals (mapcar (lambda (p) (list (%h (getf p :ref))
                                              (%h (tls-serialize 'proposal (getf p :proposal)))
-                                             (getf p :sender)))
+                                             (getf p :sender) (%h (getf p :digest))))
                            (mls-group-proposals g))
         :external-psks (mapcar (lambda (c) (list (%h (car c)) (%h (cdr c)))) (mls-group-external-psks g))
         :resumption-psks (mapcar (lambda (c) (list (car c) (%h (cdr c)))) (mls-group-resumption-psks g))
@@ -77,8 +77,9 @@
      :secret-tree (%sexp->secret-tree (getf s :secret-tree))
      :interim-hash (%o (getf s :interim-hash))
      :confirmation-tag (%o (getf s :confirmation-tag))
-     :proposals (loop for (ref p sender) in (getf s :proposals)
-                      collect (list :ref (%o ref) :proposal (tls-deserialize 'proposal (%o p)) :sender sender))
+     :proposals (loop for (ref p sender digest) in (getf s :proposals)
+                      collect (list :ref (%o ref) :proposal (tls-deserialize 'proposal (%o p)) :sender sender
+                                    :digest (%o digest)))
      :external-psks (loop for (k v) in (getf s :external-psks) collect (cons (%o k) (%o v)))
      :resumption-psks (loop for (e v) in (getf s :resumption-psks) collect (cons e (%o v)))
      :active (getf s :active))))
@@ -94,6 +95,7 @@
         :retained (mapcar #'mls-group->sexp (marmot-group-retained mg))
         :seen (loop for k being the hash-keys of (marmot-group-seen mg) collect k)
         :messages (mapcar #'%message->sexp (marmot-group-messages mg))
+        :leaving (marmot-group-leaving mg)
         :log (mapcar (lambda (n) (loop for (k v) on n by #'cddr
                                        append (list k (if (typep v '(vector (unsigned-byte 8))) (%h v) v))))
                      (marmot-group-log mg))))
@@ -102,7 +104,8 @@
   (let ((mg (make-marmot-group :mls (sexp->mls-group (getf s :mls))
                                :retained (mapcar #'sexp->mls-group (getf s :retained))
                                :messages (getf s :messages)
-                               :log (getf s :log))))
+                               :log (getf s :log)
+                               :leaving (getf s :leaving))))
     (dolist (k (getf s :seen)) (setf (gethash k (marmot-group-seen mg)) t))
     mg))
 

@@ -21,7 +21,8 @@
   (seen (make-hash-table :test #'equal))   ; message-id hex -> T
   pending                 ; STAGED-COMMIT awaiting publication
   (messages '())          ; delivered app events, newest first (plist per message)
-  (log '()))              ; state notifications, newest first
+  (log '())               ; state notifications, newest first
+  (leaving nil))          ; T after we published a SelfRemove (member-departure.md)
 
 (defun mg-id (mg) (mls-group-id (marmot-group-mls mg)))
 (defun mg-id-hex (mg) (octets->hex (mg-id mg)))
@@ -147,6 +148,39 @@ matches."
       ev)))
 
 ;;; ---------------------------------------------------------------------------
+;;; Authorization (group-messaging.md "Commit authorization", admin-policy-v1.md)
+
+(defun %leaf-account-at (mls leaf-index)
+  (let ((ln (mls-group-member-leaf mls leaf-index)))
+    (and ln (leaf-account ln))))
+
+(defun proposal-authorization-error (mls proposal sender)
+  "NIL if SENDER may send PROPOSAL as a standalone proposal in state MLS."
+  (let ((admin (active-admin-p mls (%leaf-account-at mls sender)))
+        (ty (proposal-type proposal)))
+    (cond ((= ty +prop-self-remove+)
+           (and admin "an active admin may not SelfRemove"))
+          (admin nil)
+          (t (format nil "non-admin standalone proposal of type ~D" ty)))))
+
+(defun commit-authorization-error (mls committer proposals)
+  "NIL if COMMITTER may commit PROPOSALS ((proposal . sender) pairs) against
+candidate parent MLS."
+  (let ((admin (active-admin-p mls (%leaf-account-at mls committer)))
+        (types (mapcar (lambda (ps) (proposal-type (car ps))) proposals)))
+    ;; every SelfRemove must target its (non-admin) sender
+    (dolist (ps proposals)
+      (when (= (proposal-type (car ps)) +prop-self-remove+)
+        (when (active-admin-p mls (%leaf-account-at mls (cdr ps)))
+          (return-from commit-authorization-error "SelfRemove from an active admin"))
+        (when (eql (cdr ps) committer)
+          (return-from commit-authorization-error "committer commits its own SelfRemove"))))
+    (cond (admin nil)
+          ((null proposals) nil)                                  ; self-update
+          ((every (lambda (ty) (= ty +prop-self-remove+)) types) nil) ; SelfRemove-only
+          (t (format nil "non-admin commit with proposal types ~S" types)))))
+
+;;; ---------------------------------------------------------------------------
 ;;; Receiving
 
 (defun %retain (mg old)
@@ -213,13 +247,26 @@ matches."
                       (mls-error (c) (return-from receive-group-event
                                        (list (list :type :rejected :reason (mls-error-message c))))))))
              (ecase (getf r :type)
-               (:proposal (list (list :type :proposal :sender (getf r :sender)
-                                      :proposal-type (proposal-type (getf r :proposal)))))
-               (:commit (handler-case (%apply-new-epoch mg (getf r :new-group)
-                                                        :commit (getf r :commit)
-                                                        :committer (getf r :sender))
-                          (marmot-error (c)
-                            (list (list :type :rejected :reason (marmot-error-message c)))))))))
+               (:proposal
+                (let ((why (proposal-authorization-error state (getf r :proposal) (getf r :sender))))
+                  (if why
+                      (progn (setf (mls-group-proposals state)
+                                   (remove (getf r :ref) (mls-group-proposals state)
+                                           :key (lambda (x) (getf x :ref)) :test #'octets=))
+                             (list (list :type :rejected :reason why)))
+                      (list (list :type :proposal :sender (getf r :sender)
+                                  :proposal-type (proposal-type (getf r :proposal)))))))
+               (:commit
+                (let ((why (commit-authorization-error
+                            state (getf r :sender)
+                            (%resolve-proposals state (getf r :commit) (getf r :sender)))))
+                  (if why
+                      (list (list :type :rejected :reason why))
+                      (handler-case (%apply-new-epoch mg (getf r :new-group)
+                                                      :commit (getf r :commit)
+                                                      :committer (getf r :sender))
+                        (marmot-error (c)
+                          (list (list :type :rejected :reason (marmot-error-message c)))))))))))
           (t
            (let ((r (handler-case (process-message state bytes)
                       (mls-error (c) (return-from receive-group-event
@@ -317,6 +364,14 @@ failure without touching BUNDLE."
   "Prepare a commit (see CREATE-COMMIT).  Records it as pending and returns
 the STAGED-COMMIT.  Marmot authorization is checked against the current state."
   (when (marmot-group-pending mg) (marmot-fail "a commit is already pending"))
+  (when (marmot-group-leaving mg) (marmot-fail "we are leaving this group"))
+  (let* ((mls (marmot-group-mls mg))
+         (own (mls-group-own-leaf mls))
+         (why (commit-authorization-error
+               mls own (append (mapcar (lambda (p) (cons p own)) (getf args :proposals))
+                               (mapcar (lambda (rp) (cons (getf rp :proposal) (getf rp :sender)))
+                                       (getf args :by-reference))))))
+    (when why (marmot-fail "not authorized: ~A" why)))
   (let ((staged (handler-case (apply #'create-commit (marmot-group-mls mg) args)
                   (mls-error (c) (marmot-fail "~A" (mls-error-message c))))))
     (validate-marmot-group-state (staged-commit-new-group staged))
@@ -340,8 +395,34 @@ the STAGED-COMMIT.  Marmot authorization is checked against the current state."
                        :tags (list (list "e" kp-event-id) (cons "relays" relays))
                        :content (octets->base64 (staged-commit-welcome staged))))
 
+(defun pending-self-removes (mg)
+  "Retained SelfRemove proposals from other members (plists), at most one per
+leaving leaf: the one with the lowest proposal digest."
+  (let* ((mls (marmot-group-mls mg))
+         (own (mls-group-own-leaf mls))
+         (best (make-hash-table)))
+    (dolist (rp (mls-group-proposals mls))
+      (when (and (= (proposal-type (getf rp :proposal)) +prop-self-remove+)
+                 (/= (getf rp :sender) own)
+                 (mls-group-member-leaf mls (getf rp :sender)))
+        (let ((cur (gethash (getf rp :sender) best)))
+          (when (or (null cur) (octets< (getf rp :digest) (getf cur :digest)))
+            (setf (gethash (getf rp :sender) best) rp)))))
+    (loop for v being the hash-values of best collect v)))
+
+(defun self-remove-message (mg)
+  "Our SelfRemove proposal as a kind 445 event (member-departure.md)."
+  (let ((mls (marmot-group-mls mg)))
+    (when (active-admin-p mls (%leaf-account-at mls (mls-group-own-leaf mls)))
+      (marmot-fail "an admin must leave the admin list before leaving"))
+    (multiple-value-bind (bytes ref) (create-proposal-message mls (make-proposal :type +prop-self-remove+))
+      (declare (ignore ref))
+      (setf (gethash (octets->hex (sha256 bytes)) (marmot-group-seen mg)) t)
+      (seal-group-message mls bytes))))
+
 (defun send-app-message (mg account-pubkey kind content &key (tags '()))
   "Encrypt an app event; returns the kind 445 event to publish."
+  (when (marmot-group-leaving mg) (marmot-fail "we are leaving this group"))
   (let* ((mls (marmot-group-mls mg))
          (app (make-app-event account-pubkey kind content :tags tags))
          (bytes (create-application-message mls (encode-app-event app))))
