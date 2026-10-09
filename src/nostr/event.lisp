@@ -1,9 +1,13 @@
-;;;; event.lisp — NIP-01 events
+;;;; event.lisp — Nostr events, gift wraps and relays, through cl-nostr
 ;;;;
-;;;; Fields keep their wire representation: id, pubkey and sig are lowercase
-;;;; hex strings, tags a list of lists of strings.  The id preimage is the
-;;;; NIP-01 serialization [0,pubkey,created_at,kind,tags,content] produced by
-;;;; TO-JSON, whose string escaping is NIP-01's.
+;;;; Events are cl-nostr's EVENT struct (accessors EV:EVENT-ID, EV:EVENT-PUBKEY,
+;;;; … with hex strings for id/pubkey/sig and tags as lists of lists of strings);
+;;;; ids, signatures, NIP-44 and NIP-59 are cl-nostr's.  What stays here is the
+;;;; Marmot-side strictness cl-nostr does not need for chat: decoding an event
+;;;; from JSON with unknown members, duplicate keys, a sig where none may appear,
+;;;; or a mistyped field all rejected (application-messages.md "Encoding"), the
+;;;; exact-cardinality tag readers of transports/nostr.md, and an encoder for
+;;;; unsigned events (rumors, app payloads) that writes no sig member at all.
 
 (in-package #:cl-marmot)
 
@@ -14,133 +18,130 @@
 (defun nostr-fail (fmt &rest args)
   (error 'nostr-error :message (apply #'format nil fmt args)))
 
-(defstruct nostr-event
-  id pubkey (created-at 0) (kind 1) (tags '()) (content "") sig)
+;;; Keys
+
+(defun generate-nostr-key ()
+  (coerce-octets (k:keypair-secret-key (k:generate-keypair))))
+
+(defun %keypair (sk) (k:keypair-from-secret (ensure-octets sk)))
+
+;;; Construction
+
+(defun compute-event-id (e)
+  (ev:compute-id (ev:event-pubkey e) (ev:event-created-at e) (ev:event-kind e)
+                 (ev:event-tags e) (ev:event-content e)))
+
+(defun make-unsigned-event (&key pubkey (created-at (unix-time)) kind (tags '()) (content ""))
+  "An event with its id and no signature (a NIP-59 rumor or a Marmot app
+event).  PUBKEY may be octets or hex."
+  (let ((e (ev:make-event :pubkey (if (stringp pubkey) pubkey (octets->hex pubkey))
+                          :created-at created-at :kind kind :tags tags :content content)))
+    (setf (ev:event-id e) (compute-event-id e))
+    e))
+
+(defun make-signed-event (sk &key (created-at (unix-time)) kind (tags '()) (content ""))
+  (ev:build-event (%keypair sk) kind content :tags tags :created-at created-at))
+
+(defun verify-event (e) (and (ignore-errors (ev:verify-event e)) t))
+
+;;; JSON
 
 (defun %tags->json (tags)
   (coerce (mapcar (lambda (tag) (coerce tag 'simple-vector)) tags) 'simple-vector))
 
-(defun event-id-preimage (ev)
-  (to-json (jarr 0 (nostr-event-pubkey ev) (nostr-event-created-at ev) (nostr-event-kind ev)
-                 (%tags->json (nostr-event-tags ev)) (nostr-event-content ev))))
+(defun event->jobj (e)
+  (let ((fields (list "id" (ev:event-id e) "pubkey" (ev:event-pubkey e)
+                      "created_at" (ev:event-created-at e) "kind" (ev:event-kind e)
+                      "tags" (%tags->json (ev:event-tags e)) "content" (ev:event-content e))))
+    (apply #'jobj (if (ev:event-sig e) (append fields (list "sig" (ev:event-sig e))) fields))))
 
-(defun compute-event-id (ev)
-  (octets->hex (sha256 (string->utf8 (event-id-preimage ev)))))
-
-(defun keypair-from-secret (sk)
-  "Returns (values sk pubkey-octets)."
-  (unless (secp256k1-valid-seckey-p sk) (nostr-fail "invalid secret key"))
-  (values sk (secp256k1-xonly-pubkey sk)))
-
-(defun generate-nostr-key ()
-  (loop (let ((sk (random-octets 32)))
-          (when (secp256k1-valid-seckey-p sk) (return sk)))))
-
-(defun make-unsigned-event (&key pubkey (created-at (unix-time)) kind (tags '()) (content ""))
-  "An event with its id computed and no signature (a NIP-59 rumor, or a Marmot
-app event).  PUBKEY may be octets or hex."
-  (let ((ev (make-nostr-event :pubkey (if (stringp pubkey) pubkey (octets->hex pubkey))
-                              :created-at created-at :kind kind :tags tags :content content)))
-    (setf (nostr-event-id ev) (compute-event-id ev))
-    ev))
-
-(defun sign-event (ev sk)
-  "Fill in pubkey, id and sig from secret key SK (octets)."
-  (setf (nostr-event-pubkey ev) (octets->hex (secp256k1-xonly-pubkey sk)))
-  (setf (nostr-event-id ev) (compute-event-id ev))
-  (setf (nostr-event-sig ev) (octets->hex (bip340-sign sk (hex->octets (nostr-event-id ev)))))
-  ev)
-
-(defun make-signed-event (sk &key (created-at (unix-time)) kind (tags '()) (content ""))
-  (sign-event (make-nostr-event :created-at created-at :kind kind :tags tags :content content) sk))
+(defun event->json (e) (to-json (event->jobj e)))
 
 (defun %lower-hex-p (s n)
   (and (stringp s) (= (length s) n)
        (every (lambda (c) (or (digit-char-p c) (find c "abcdef"))) s)))
 
-(defun verify-event (ev)
-  "True iff the id matches the content and the BIP-340 signature verifies."
-  (and (%lower-hex-p (nostr-event-id ev) 64)
-       (%lower-hex-p (nostr-event-pubkey ev) 64)
-       (%lower-hex-p (nostr-event-sig ev) 128)
-       (string= (nostr-event-id ev) (compute-event-id ev))
-       (bip340-verify (hex->octets (nostr-event-pubkey ev))
-                      (hex->octets (nostr-event-id ev))
-                      (hex->octets (nostr-event-sig ev)))))
-
-(defun event->jobj (ev)
-  (let ((fields (list "id" (nostr-event-id ev)
-                      "pubkey" (nostr-event-pubkey ev)
-                      "created_at" (nostr-event-created-at ev)
-                      "kind" (nostr-event-kind ev)
-                      "tags" (%tags->json (nostr-event-tags ev))
-                      "content" (nostr-event-content ev))))
-    (apply #'jobj (if (nostr-event-sig ev) (append fields (list "sig" (nostr-event-sig ev))) fields))))
-
-(defun event->json (ev) (to-json (event->jobj ev)))
-
 (defun jobj->event (obj &key (allow-sig t) (require-sig nil) (strict nil))
-  "Decode a JSON event object.  STRICT rejects unknown members (the Marmot app
-payload rule); the caller decides whether a sig is allowed or required."
+  "Decode a JSON event object (as parsed by PARSE-JSON).  STRICT rejects unknown
+members; the caller decides whether a sig is allowed or required."
   (unless (jobj-p obj) (nostr-fail "event is not an object"))
   (when strict
     (dolist (cell (cdr obj))
       (unless (member (car cell) '("id" "pubkey" "created_at" "kind" "tags" "content" "sig")
                       :test #'string=)
         (nostr-fail "unknown event member ~S" (car cell)))))
-  (let ((sig (jget obj "sig")))
+  (let ((sig (jget obj "sig")) (tags (jget obj "tags"))
+        (kind (jget obj "kind")) (created (jget obj "created_at")))
     (when (and sig (not allow-sig)) (nostr-fail "event must not carry a sig"))
     (when (and require-sig (not (stringp sig))) (nostr-fail "event has no sig"))
-    (let ((tags (jget obj "tags")))
-      (unless (and (vectorp tags) (not (stringp tags))
-                   (every (lambda (tag) (and (vectorp tag) (not (stringp tag)) (every #'stringp tag))) tags))
-        (nostr-fail "malformed tags"))
-      (let ((kind (jget obj "kind")) (created (jget obj "created_at")))
-        (unless (and (integerp kind) (<= 0 kind 65535)) (nostr-fail "bad kind"))
-        (unless (and (integerp created) (<= 0 created)) (nostr-fail "bad created_at"))
-        (unless (stringp (jget obj "content")) (nostr-fail "bad content"))
-        (unless (%lower-hex-p (jget obj "id") 64) (nostr-fail "bad id"))
-        (unless (%lower-hex-p (jget obj "pubkey") 64) (nostr-fail "bad pubkey"))
-        (make-nostr-event :id (jget obj "id") :pubkey (jget obj "pubkey") :created-at created
-                          :kind kind :tags (map 'list (lambda (tag) (coerce tag 'list)) tags)
-                          :content (jget obj "content") :sig (and (stringp sig) sig))))))
+    (unless (and (vectorp tags) (not (stringp tags))
+                 (every (lambda (tag) (and (vectorp tag) (not (stringp tag)) (every #'stringp tag))) tags))
+      (nostr-fail "malformed tags"))
+    (unless (and (integerp kind) (<= 0 kind 65535)) (nostr-fail "bad kind"))
+    (unless (and (integerp created) (<= 0 created)) (nostr-fail "bad created_at"))
+    (unless (stringp (jget obj "content")) (nostr-fail "bad content"))
+    (unless (%lower-hex-p (jget obj "id") 64) (nostr-fail "bad id"))
+    (unless (%lower-hex-p (jget obj "pubkey") 64) (nostr-fail "bad pubkey"))
+    (ev:make-event :id (jget obj "id") :pubkey (jget obj "pubkey") :created-at created :kind kind
+                   :tags (map 'list (lambda (tag) (coerce tag 'list)) tags)
+                   :content (jget obj "content") :sig (and (stringp sig) sig))))
 
 (defun json->event (string &rest args)
   (apply #'jobj->event (parse-json string) args))
 
-;;; Tag helpers
+;;; Tags (transports/nostr.md "Event identity and tag cardinality")
 
-(defun event-tags-named (ev name)
-  (remove-if-not (lambda (tag) (and tag (string= (first tag) name))) (nostr-event-tags ev)))
+(defun event-tags-named (e name)
+  (remove-if-not (lambda (tag) (and tag (string= (first tag) name))) (ev:event-tags e)))
 
-(defun event-tag-value (ev name)
-  "The single value of a singleton tag NAME; signals if the tag is missing,
-repeated, or does not have exactly one value (Marmot's cardinality rule)."
-  (let ((tags (event-tags-named ev name)))
+(defun event-tag-value (e name)
+  "The single value of a singleton tag NAME; signals if it is missing, repeated,
+or does not have exactly one value."
+  (let ((tags (event-tags-named e name)))
     (unless (= (length tags) 1) (nostr-fail "expected exactly one ~S tag, got ~D" name (length tags)))
     (unless (= (length (first tags)) 2) (nostr-fail "~S tag must have exactly one value" name))
     (second (first tags))))
 
-(defun event-tag-values (ev name)
-  "All values of a single list tag NAME (the tag must appear exactly once)."
-  (let ((tags (event-tags-named ev name)))
+(defun event-tag-values (e name)
+  "All values of the single list tag NAME (which must appear exactly once)."
+  (let ((tags (event-tags-named e name)))
     (unless (= (length tags) 1) (nostr-fail "expected exactly one ~S tag, got ~D" name (length tags)))
     (rest (first tags))))
 
-;;; Relay-list helpers (NIP-65 10002, NIP-17 10050)
+;;; Relay lists (NIP-65 kind 10002, NIP-17 kind 10050)
 
-(defun relay-list-event (sk kind relays &key write-only)
+(defun relay-list-event (sk kind relays)
   (make-signed-event sk :kind kind
-                        :tags (mapcar (lambda (r)
-                                        (cond ((= kind 10050) (list "relay" r))
-                                              (write-only (list "r" r "write"))
-                                              (t (list "r" r))))
+                        :tags (mapcar (lambda (r) (if (= kind 10050) (list "relay" r) (list "r" r)))
                                       relays)))
 
-(defun nip65-write-relays (ev)
-  (loop for tag in (event-tags-named ev "r")
+(defun nip65-write-relays (e)
+  (loop for tag in (event-tags-named e "r")
         when (or (= (length tag) 2) (and (= (length tag) 3) (string= (third tag) "write")))
           collect (second tag)))
 
-(defun nip17-inbox-relays (ev)
-  (mapcar #'second (remove-if-not (lambda (tag) (= (length tag) 2)) (event-tags-named ev "relay"))))
+(defun nip17-inbox-relays (e)
+  (mapcar #'second (remove-if-not (lambda (tag) (= (length tag) 2)) (event-tags-named e "relay"))))
+
+;;; NIP-59
+
+(defun gift-wrap (rumor author-sk recipient-pubkey-hex)
+  "Wrap the unsigned RUMOR (authored by AUTHOR-SK's key) for RECIPIENT."
+  (nip59:wrap-rumor (%keypair author-sk) recipient-pubkey-hex (ev:event-kind rumor) (ev:event-content rumor)
+                    :tags (ev:event-tags rumor) :created-at (ev:event-created-at rumor)))
+
+(defun gift-unwrap (wrap my-sk)
+  "Returns (values rumor seal); signals NOSTR-ERROR on any failure."
+  (handler-case (nip59:unwrap-rumor (%keypair my-sk) wrap)
+    (error (c) (nostr-fail "~A" c))))
+
+;;; NIP-19
+
+(defun npub-encode (pubkey) (b32:npub-encode (ensure-octets pubkey)))
+(defun nsec-decode (nsec) (coerce-octets (b32:nsec-decode nsec)))
+
+(defun parse-pubkey (string)
+  "An npub, nprofile or 64-hex pubkey, as 32 octets."
+  (let ((hex (handler-case (b32:pubkey-hex string) (error () nil))))
+    (unless (%lower-hex-p hex 64) (nostr-fail "not a public key: ~A" string))
+    (hex->octets hex)))

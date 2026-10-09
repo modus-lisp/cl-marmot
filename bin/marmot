@@ -1,21 +1,11 @@
 #!/bin/sh
 # marmot — the cl-marmot command line client (SBCL).
-# wss:// relays need seal + natrium (github.com/modus-lisp); set MODUS_LISP to
-# the directory holding them (default: ../modus-lisp next to this checkout, then
-# ~/modus-lisp).  Without them only ws:// relays work.
+# Dependencies: the modus-lisp libraries (natrium, secp256k1-fast, seal,
+# cl-nostr) in $MODUS_LISP, ../modus-lisp or ~/modus-lisp, and Quicklisp for
+# cl-nostr's own dependencies.  See load-deps.lisp.
 here="$(cd "$(dirname "$0")/.." && pwd)"
-libs="${MODUS_LISP:-}"
-for d in "$here/../modus-lisp" "$HOME/modus-lisp"; do
-  [ -z "$libs" ] && [ -f "$d/seal/seal.asd" ] && libs="$d"
-done
-system=cl-marmot; extra=""
-if [ -n "$libs" ] && [ -f "$libs/seal/seal.asd" ] && [ -f "$libs/natrium/natrium.asd" ]; then
-  system=cl-marmot/wss
-  extra="(push #p\"$libs/seal/\" asdf:*central-registry*) (push #p\"$libs/natrium/\" asdf:*central-registry*)"
-fi
 exec sbcl --noinform --non-interactive --no-userinit \
-  --eval '(require :asdf)' \
-  --eval "(progn (push #p\"$here/\" asdf:*central-registry*) $extra)" \
-  --eval "(let ((*standard-output* (make-broadcast-stream)) (*error-output* (make-broadcast-stream))) (handler-bind ((warning (function muffle-warning))) (asdf:load-system \"$system\")))" \
-  --eval '(sb-ext:exit :code (cl-marmot::cli-main (rest sb-ext:*posix-argv*)))' \
+  --load "$here/load-deps.lisp" \
+  --eval "(let ((*standard-output* (make-broadcast-stream)) (*error-output* (make-broadcast-stream))) (handler-bind ((warning (function muffle-warning))) (ql:quickload :cl-marmot :silent t)))" \
+  --eval '(sb-ext:exit :code (cl-marmot::cli-main (rest sb-ext:*posix-argv*)) :abort t)' \
   --end-toplevel-options "$@"

@@ -209,15 +209,6 @@
       (setf (aref bad (1- (length bad))) (logxor #x40 (aref bad (1- (length bad)))))
       (signals aead-error (aes-gcm-decrypt key iv bad aad)))))
 
-(deftest aes-fips197 ()
-  ;; FIPS 197 Appendix C.1 / C.3 example vectors.
-  (is-hex "69c4e0d86a7b0430d8cdb78070b4c55a"
-          (aes-encrypt (hex "000102030405060708090a0b0c0d0e0f")
-                       (hex "00112233445566778899aabbccddeeff")))
-  (is-hex "8ea2b7ca516745bfeafc49904b496089"
-          (aes-encrypt (hex "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
-                       (hex "00112233445566778899aabbccddeeff"))))
-
 ;;; ------------------------------------------------------------------ X25519
 ;;; RFC 7748 sections 5.2 and 6.1.
 
@@ -291,7 +282,7 @@
     ;; S >= L must be rejected (add L to S).
     (let* ((s (octets->int-le sig :start 32 :end 64))
            (bad (concat-octets (subseq-octets sig 0 32)
-                               (int->octets-le (+ s cl-marmot::+ed25519-l+) 32))))
+                               (int->octets-le (+ s (+ (expt 2 252) 27742317777372353535851937790883648493)) 32))))
       (is (not (ed25519-verify pub (make-octets 0) bad))))
     ;; A public key with y >= p is not a valid encoding.
     (is (not (ed25519-verify (make-octets 32 :initial-element #xff) (make-octets 0) sig)))))
@@ -506,16 +497,14 @@
     ))
 
 (deftest secp256k1-ecdh-nip44 ()
+  ;; NIP-44 conversation keys through cl-nostr (ECDH over secp256k1-fast)
   (loop for (sec pub ck) in *%ct-nip44-conversation-keys*
-        do (is-hex ck (hkdf-extract (%ct-ascii "nip44-v2") (secp256k1-ecdh-x (hex sec) (hex pub)))
+        do (is-hex ck (nip44:conversation-key (octets->int-be (hex sec)) (hex pub))
                    (format nil "NIP-44 conversation key for ~A" sec)))
   (dotimes (i 3)
-    (let* ((a (loop for k = (random-octets 32) when (secp256k1-valid-seckey-p k) return k))
-           (b (loop for k = (random-octets 32) when (secp256k1-valid-seckey-p k) return k)))
-      (is (octets= (secp256k1-ecdh-x a (secp256k1-xonly-pubkey b))
-                   (secp256k1-ecdh-x b (secp256k1-xonly-pubkey a)))
+    (let ((a (generate-nostr-key)) (b (generate-nostr-key)))
+      (is (octets= (nip44:conversation-key (octets->int-be a) (secp256k1-xonly-pubkey b))
+                   (nip44:conversation-key (octets->int-be b) (secp256k1-xonly-pubkey a)))
           "ECDH symmetry")))
-  (signals crypto-error (secp256k1-ecdh-x (int->octets-be 1 32)
-                                          (hex "eefdea4cdb677750a420fee807eacf21eb9898ae79b9768766e4faa04a2d4a34")))
-  (signals crypto-error (secp256k1-ecdh-x (make-octets 32)
-                                          (hex "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9"))))
+  (signals error (nip44:conversation-key 1 (hex "eefdea4cdb677750a420fee807eacf21eb9898ae79b9768766e4faa04a2d4a34"))
+           "a public key that is not on the curve"))

@@ -33,9 +33,9 @@
 (deftest wn-key-package-validates ()
   ;; a real KeyPackage event published by mdk's `wn`; validated at its own time
   (let* ((ev (json->event (string-trim '(#\Newline) (%fixture "wn-keypackage-event.json")) :require-sig t))
-         (kp (validate-key-package-event ev :now (nostr-event-created-at ev))))
+         (kp (validate-key-package-event ev :now (ev:event-created-at ev))))
     (is (key-package-last-resort-p kp))
-    (is-equal (nostr-event-pubkey ev) (octets->hex (leaf-account (key-package-leaf-node kp))))))
+    (is-equal (ev:event-pubkey ev) (octets->hex (leaf-account (key-package-leaf-node kp))))))
 
 (deftest our-key-package-validates ()
   (let* ((sk (generate-nostr-key))

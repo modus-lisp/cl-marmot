@@ -117,8 +117,8 @@ fresh ephemeral key."
                                      (and expiration (list (list "expiration" (format nil "~D" expiration))))))))
 
 (defun %validate-445-shape (ev)
-  (unless (= (nostr-event-kind ev) 445) (marmot-fail "not kind 445"))
-  (dolist (tag (nostr-event-tags ev))
+  (unless (= (ev:event-kind ev) 445) (marmot-fail "not kind 445"))
+  (dolist (tag (ev:event-tags ev))
     (unless (member (first tag) '("h" "expiration") :test #'string=)
       (marmot-fail "kind 445 carries a forbidden tag ~S" (first tag))))
   (let ((h (event-tag-value ev "h")))
@@ -128,7 +128,7 @@ fresh ephemeral key."
 (defun open-group-message (mls ev)
   "Try to decrypt kind 445 EV under MLS's epoch key.  Returns the MLS message
 octets or NIL if this epoch's key does not authenticate it."
-  (let ((data (handler-case (base64->octets (nostr-event-content ev)) (base64-error () nil))))
+  (let ((data (handler-case (base64->octets (ev:event-content ev)) (base64-error () nil))))
     (when (and data (>= (length data) 28))
       (handler-case (chacha20-poly1305-decrypt (group-event-key mls) (subseq-octets data 0 12)
                                                (subseq-octets data 12) (make-octets 0))
@@ -149,7 +149,7 @@ matches."
   (let* ((obj (parse-json (utf8->string octets) :reject-duplicate-keys t)))
     (unless (= (length (cdr obj)) 6) (marmot-fail "app event must have exactly six members"))
     (let ((ev (jobj->event obj :allow-sig nil :strict t)))
-      (unless (string= (nostr-event-id ev) (compute-event-id ev)) (marmot-fail "app event id mismatch"))
+      (unless (string= (ev:event-id ev) (compute-event-id ev)) (marmot-fail "app event id mismatch"))
       ev)))
 
 ;;; ---------------------------------------------------------------------------
@@ -282,12 +282,12 @@ candidate parent MLS."
                        (app (handler-case (decode-app-event (getf r :data))
                               (error (c) (return-from receive-group-event
                                            (list (list :type :rejected :reason (format nil "app payload: ~A" c))))))))
-                  (if (string= (nostr-event-pubkey app) (octets->hex (leaf-account leaf)))
+                  (if (string= (ev:event-pubkey app) (octets->hex (leaf-account leaf)))
                       (let ((m (list :type :message :epoch (mls-group-epoch state)
-                                     :sender (nostr-event-pubkey app)
-                                     :kind (nostr-event-kind app) :content (nostr-event-content app)
-                                     :tags (nostr-event-tags app) :id (nostr-event-id app)
-                                     :created-at (nostr-event-created-at app))))
+                                     :sender (ev:event-pubkey app)
+                                     :kind (ev:event-kind app) :content (ev:event-content app)
+                                     :tags (ev:event-tags app) :id (ev:event-id app)
+                                     :created-at (ev:event-created-at app))))
                         (push m (marmot-group-messages mg))
                         (list m))
                       (list (list :type :rejected :reason "app event pubkey is not the MLS sender")))))
@@ -300,12 +300,12 @@ candidate parent MLS."
 
 (defun welcome-rumor-parts (rumor)
   "Validate a kind 444 rumor.  Returns (values welcome-struct kp-event-id relays)."
-  (unless (= (nostr-event-kind rumor) 444) (marmot-fail "not a welcome rumor"))
+  (unless (= (ev:event-kind rumor) 444) (marmot-fail "not a welcome rumor"))
   (let ((e (event-tag-value rumor "e"))
         (relays (event-tag-values rumor "relays")))
     (unless (%lower-hex-p e 64) (marmot-fail "bad e tag"))
     (unless relays (marmot-fail "empty relays tag"))
-    (let ((msg (handler-case (tls-deserialize 'mls-message (base64->octets (nostr-event-content rumor)))
+    (let ((msg (handler-case (tls-deserialize 'mls-message (base64->octets (ev:event-content rumor)))
                  (error (c) (marmot-fail "welcome content: ~A" c)))))
       (unless (= (mls-message-wire-format msg) +wf-welcome+) (marmot-fail "content is not mls_welcome"))
       (values (mls-message-body msg) e relays))))
@@ -434,11 +434,11 @@ leaving leaf: the one with the lowest proposal digest."
          (secs (group-retention-secs mls))
          ;; message-retention-v1: exact u64 created_at + duration, else no tag
          (expiry (and (plusp secs)
-                      (let ((e (+ (nostr-event-created-at app) secs)))
+                      (let ((e (+ (ev:event-created-at app) secs)))
                         (and (< e (expt 2 64)) e)))))
     (setf (gethash (octets->hex (sha256 bytes)) (marmot-group-seen mg)) t)
-    (push (list :type :message :epoch (mls-group-epoch mls) :sender (nostr-event-pubkey app)
-                :kind kind :content content :tags tags :id (nostr-event-id app)
-                :created-at (nostr-event-created-at app) :own t)
+    (push (list :type :message :epoch (mls-group-epoch mls) :sender (ev:event-pubkey app)
+                :kind kind :content content :tags tags :id (ev:event-id app)
+                :created-at (ev:event-created-at app) :own t)
           (marmot-group-messages mg))
     (seal-group-message mls bytes :expiration expiry)))

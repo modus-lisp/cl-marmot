@@ -11,7 +11,7 @@
 (defstruct account
   sk pubkey
   (relays '())                         ; our NIP-65 / inbox / KeyPackage relays
-  (pool (make-pool))
+  (pools (make-hash-table :test #'equal))   ; relay-set key -> cl-nostr pool
   (key-packages '())                   ; list of plists (:bundle :event-id :ref :d)
   (groups (make-hash-table :test #'equal))   ; MLS group id hex -> MARMOT-GROUP
   (seen-wraps (make-hash-table :test #'equal))
@@ -28,10 +28,37 @@
 (defun new-account (&key relays)
   (make-account-from-secret (generate-nostr-key) :relays relays))
 
+;;; Relays: one cl-nostr pool per relay set, created on first use.  A publish
+;;; succeeds when at least one relay ACKs (publish-lifecycle.md); results come
+;;; back as (url accepted message) per relay, unreachable relays included.
+
+(defparameter *relay-timeout* 8 "Seconds to wait for relay ACKs / EOSE.")
+
+(defun %pool-for (acct urls)
+  (let* ((urls (sort (remove-duplicates (copy-list urls) :test #'string=) #'string<))
+         (key (format nil "~{~A~^ ~}" urls)))
+    (or (gethash key (account-pools acct))
+        (setf (gethash key (account-pools acct)) (pool:make-pool urls :timeout *relay-timeout*)))))
+
+(defun close-account-pools (acct)
+  (loop for p being the hash-values of (account-pools acct) do (ignore-errors (pool:close-pool p)))
+  (clrhash (account-pools acct)))
+
+(defun pool-publish* (acct urls ev)
+  (mapcar (lambda (ack) (list (pool:ack-url ack) (pool:ack-accepted-p ack) (pool:ack-message ack)))
+          (pool:pool-publish-sync (%pool-for acct urls) ev :timeout *relay-timeout*)))
+
+(defun publish-accepted-p (results) (some #'second results))
+
+(defun pool-query (acct urls filters)
+  "Stored events matching FILTERS on URLS, each one verified (id + signature)."
+  (remove-if-not #'verify-event
+                 (pool:fetch-events (%pool-for acct urls) filters :timeout *relay-timeout*)))
+
 (defun %publish (acct urls ev &key (require t))
-  (let ((results (pool-publish (account-pool acct) urls ev)))
+  (let ((results (pool-publish* acct urls ev)))
     (when (and require (not (publish-accepted-p results)))
-      (marmot-fail "no relay accepted kind ~D: ~S" (nostr-event-kind ev) results))
+      (marmot-fail "no relay accepted kind ~D: ~S" (ev:event-kind ev) results))
     results))
 
 ;;; ---------------------------------------------------------------------------
@@ -49,7 +76,7 @@
   "Create and publish a fresh KeyPackage in slot D.  Returns its plist."
   (let* ((bundle (make-marmot-key-package (account-sk acct)))
          (ev (key-package-event (account-sk acct) bundle d))
-         (entry (list :bundle bundle :event-id (nostr-event-id ev)
+         (entry (list :bundle bundle :event-id (ev:event-id ev)
                       :ref (octets->hex (key-package-ref (key-package-bundle-key-package bundle)))
                       :d d)))
     (%publish acct (account-relays acct) ev)
@@ -66,14 +93,14 @@
 
 (defun %latest (events)
   (first (sort (copy-list events) (lambda (a b)
-                                    (or (> (nostr-event-created-at a) (nostr-event-created-at b))
-                                        (and (= (nostr-event-created-at a) (nostr-event-created-at b))
-                                             (string< (nostr-event-id a) (nostr-event-id b))))))))
+                                    (or (> (ev:event-created-at a) (ev:event-created-at b))
+                                        (and (= (ev:event-created-at a) (ev:event-created-at b))
+                                             (string< (ev:event-id a) (ev:event-id b))))))))
 
 (defun fetch-relay-list (acct pubkey-hex kind &key (lookup-relays (account-relays acct)))
-  (let ((ev (%latest (remove-if-not (lambda (e) (string= (nostr-event-pubkey e) pubkey-hex))
-                                    (pool-query (account-pool acct) lookup-relays
-                                                (list (filter "kinds" (list kind) "authors" (list pubkey-hex))))))))
+  (let ((ev (%latest (remove-if-not (lambda (e) (string= (ev:event-pubkey e) pubkey-hex))
+                                    (pool-query acct lookup-relays
+                                                (list (flt:make-filter :kinds (list kind) :authors (list pubkey-hex))))))))
     (and ev (if (= kind 10002) (nip65-write-relays ev) (nip17-inbox-relays ev)))))
 
 (defun fetch-key-package (acct pubkey-hex)
@@ -81,12 +108,12 @@
 (values key-package event)."
   (let* ((relays (or (fetch-relay-list acct pubkey-hex 10002)
                      (marmot-fail "~A has no NIP-65 relay list" pubkey-hex)))
-         (events (pool-query (account-pool acct) relays
-                             (list (filter "kinds" '(30443) "authors" (list pubkey-hex)))))
+         (events (pool-query acct relays
+                             (list (flt:make-filter :kinds '(30443) :authors (list pubkey-hex)))))
          (slots (make-hash-table :test #'equal)))
     ;; newest per (author, d) slot
     (dolist (ev events)
-      (when (string= (nostr-event-pubkey ev) pubkey-hex)
+      (when (string= (ev:event-pubkey ev) pubkey-hex)
         (let ((d (ignore-errors (event-tag-value ev "d"))))
           (when d (setf (gethash d slots) (%latest (cons ev (let ((x (gethash d slots))) (and x (list x))))))))))
     (let ((valid '()))
@@ -101,8 +128,8 @@
                                        (lb (key-package-last-resort-p (car b))))
                                    (cond ((and (not la) lb) t)
                                          ((and la (not lb)) nil)
-                                         ((/= (nostr-event-created-at (cdr a)) (nostr-event-created-at (cdr b)))
-                                          (> (nostr-event-created-at (cdr a)) (nostr-event-created-at (cdr b))))
+                                         ((/= (ev:event-created-at (cdr a)) (ev:event-created-at (cdr b)))
+                                          (> (ev:event-created-at (cdr a)) (ev:event-created-at (cdr b))))
                                          (t (octets< (key-package-ref (car a)) (key-package-ref (car b)))))))))))
         (values (car best) (cdr best))))))
 
@@ -111,12 +138,12 @@
 
 (defun process-gift-wrap (acct wrap)
   "Returns the new MARMOT-GROUP if WRAP was a Welcome we could join."
-  (when (gethash (nostr-event-id wrap) (account-seen-wraps acct))
+  (when (gethash (ev:event-id wrap) (account-seen-wraps acct))
     (return-from process-gift-wrap nil))
-  (setf (gethash (nostr-event-id wrap) (account-seen-wraps acct)) t)
+  (setf (gethash (ev:event-id wrap) (account-seen-wraps acct)) t)
   (let ((rumor (handler-case (gift-unwrap wrap (account-sk acct))
-                 (error (c) (warn "gift wrap ~A: ~A" (nostr-event-id wrap) c) nil))))
-    (when (and rumor (= (nostr-event-kind rumor) 444))
+                 (error (c) (warn "gift wrap ~A: ~A" (ev:event-id wrap) c) nil))))
+    (when (and rumor (= (ev:event-kind rumor) 444))
       (multiple-value-bind (welcome kp-event-id relays) (welcome-rumor-parts rumor)
         (declare (ignore relays))
         (let ((entry (find-if (lambda (e)
@@ -124,7 +151,7 @@
                                       :key #'encrypted-group-secrets-new-member :test #'octets=))
                               (account-key-packages acct))))
           (unless entry
-            (warn "Welcome ~A references no KeyPackage of ours (e=~A)" (nostr-event-id rumor) kp-event-id)
+            (warn "Welcome ~A references no KeyPackage of ours (e=~A)" (ev:event-id rumor) kp-event-id)
             (return-from process-gift-wrap nil))
           (let ((mg (handler-case (join-marmot-group welcome (getf entry :bundle))
                       (marmot-error (c) (warn "rejected Welcome: ~A" (marmot-error-message c)) nil))))
@@ -134,7 +161,7 @@
                 (return-from process-gift-wrap nil))
               (setf (gethash (mg-id-hex mg) (account-groups acct)) mg)
               (%note mg :type :joined :epoch (mg-epoch mg)
-                        :inviter (nostr-event-pubkey rumor))
+                        :inviter (ev:event-pubkey rumor))
               ;; key-packages.md: publish a replacement in the same slot; the
               ;; consumed init_key is deleted once the replacement is confirmed
               ;; (a single-use package is spent either way)
@@ -167,7 +194,7 @@
         when (string= h (octets->hex (mg-nostr-group-id g))) return g))
 
 (defun process-group-event (acct ev)
-  (when (gethash (nostr-event-id ev) (account-seen-group-events acct))
+  (when (gethash (ev:event-id ev) (account-seen-group-events acct))
     (return-from process-group-event nil))
   (let* ((h (ignore-errors (event-tag-value ev "h")))
          (mg (and h (%group-for-h acct h))))
@@ -176,7 +203,7 @@
                        (marmot-error (c) (list (list :type :rejected :reason (marmot-error-message c)))))))
         ;; undecryptable input may become readable after a later commit: keep it eligible
         (unless (equal results '((:type :undecryptable)))
-          (setf (gethash (nostr-event-id ev) (account-seen-group-events acct)) t))
+          (setf (gethash (ev:event-id ev) (account-seen-group-events acct)) t))
         (when (account-on-event acct)
           (dolist (r results) (funcall (account-on-event acct) acct mg r)))
         results))))
@@ -187,9 +214,9 @@ results produced."
   (let ((results '())
         (since (max 0 (- (account-last-sync acct) (* 3 24 3600)))))  ; gift wraps are back-dated
     (setf (account-last-sync acct) (unix-time))
-    (dolist (wrap (pool-query (account-pool acct) (account-relays acct)
-                              (list (filter "kinds" '(1059) "#p" (list (account-pubkey-hex acct))
-                                            "since" since))))
+    (dolist (wrap (pool-query acct (account-relays acct)
+                              (list (flt:make-filter :kinds '(1059) :tags (list (cons "p" (list (account-pubkey-hex acct))))
+                                                     :since since))))
       (let ((mg (process-gift-wrap acct wrap)))
         (when mg (push (list :type :joined :group (mg-id-hex mg)) results))))
     ;; group traffic, repeated while it makes progress (a commit can unlock queued messages)
@@ -197,9 +224,9 @@ results produced."
           do (let ((progress nil))
                (loop for mg being the hash-values of (account-groups acct)
                      for gid = (octets->hex (mg-nostr-group-id mg))
-                     do (let ((events (sort (pool-query (account-pool acct) (mg-relays mg)
-                                                        (list (filter "kinds" '(445) "#h" (list gid))))
-                                            #'< :key #'nostr-event-created-at)))
+                     do (let ((events (sort (pool-query acct (mg-relays mg)
+                                                        (list (flt:make-filter :kinds '(445) :tags (list (cons "h" (list gid))))))
+                                            #'< :key #'ev:event-created-at)))
                           (dolist (ev events)
                             (let ((r (process-group-event acct ev)))
                               (when (and r (notany (lambda (x) (eq (getf x :type) :undecryptable)) r))
@@ -217,7 +244,7 @@ results produced."
 delivery to that invitee's inbox relays."
   (loop for (pk . kp-ev) in invitees
         collect (let* ((inbox (or (fetch-relay-list acct pk 10050) (account-relays acct)))
-                       (rumor (welcome-rumor (account-pubkey acct) staged (nostr-event-id kp-ev) (mg-relays mg)))
+                       (rumor (welcome-rumor (account-pubkey acct) staged (ev:event-id kp-ev) (mg-relays mg)))
                        (wrap (gift-wrap rumor (account-sk acct) pk)))
                   (list pk (publish-accepted-p (%publish acct inbox wrap :require nil))))))
 
@@ -245,7 +272,7 @@ acknowledgement, discard otherwise.  Returns the relay results."
   (let* ((staged (marmot-group-pending mg))
          (ev (seal-group-message (marmot-group-mls mg) (staged-commit-message staged)))
          (results (%publish acct (mg-relays mg) ev :require nil)))
-    (setf (gethash (nostr-event-id ev) (account-seen-group-events acct)) t)
+    (setf (gethash (ev:event-id ev) (account-seen-group-events acct)) t)
     (if (publish-accepted-p results)
         (merge-pending mg)
         (progn (discard-pending mg) (marmot-fail "commit not accepted by any relay: ~S" results)))
@@ -292,7 +319,7 @@ acknowledgement, discard otherwise.  Returns the relay results."
 
 (defun send-message (acct mg text &key (kind 9) (tags '()))
   (let ((ev (send-app-message mg (account-pubkey acct) kind text :tags tags)))
-    (setf (gethash (nostr-event-id ev) (account-seen-group-events acct)) t)
+    (setf (gethash (ev:event-id ev) (account-seen-group-events acct)) t)
     (%publish acct (mg-relays mg) ev)))
 
 ;;; ---------------------------------------------------------------------------
@@ -324,7 +351,7 @@ admin), then publishes a SelfRemove proposal for a remaining member to commit."
         (unless others (marmot-fail "you are the only admin: promote someone first"))
         (set-admins acct mg others)))
     (let ((ev (self-remove-message mg)))
-      (setf (gethash (nostr-event-id ev) (account-seen-group-events acct)) t)
+      (setf (gethash (ev:event-id ev) (account-seen-group-events acct)) t)
       (%publish acct (mg-relays mg) ev)
       (setf (marmot-group-leaving mg) t))))
 

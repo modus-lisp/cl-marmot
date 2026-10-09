@@ -111,7 +111,7 @@
 
 (defun identity-proof-event (signer-pubkey created-at mls-signature-key
                              &key (ciphersuite 1) (signature-scheme +signature-scheme-ed25519+))
-  (make-nostr-event :pubkey (octets->hex signer-pubkey) :created-at created-at :kind 450
+  (ev:make-event :pubkey (octets->hex signer-pubkey) :created-at created-at :kind 450
                     :tags (list (list "d" "marmot.account-identity-proof.v2")
                                 (list "component" "0x8009")
                                 (list "ciphersuite" (%hex16 ciphersuite))
@@ -123,7 +123,7 @@
   "The 104-byte MarmotAuthorizationProof binding MLS-SIGNATURE-KEY to the account."
   (let* ((pub (secp256k1-xonly-pubkey account-sk))
          (ev (identity-proof-event pub created-at mls-signature-key))
-         (id (sha256 (string->utf8 (event-id-preimage ev)))))
+         (id (hex->octets (compute-event-id ev))))
     (concat-octets pub (int->octets-be created-at 8) (bip340-sign account-sk id))))
 
 (defun verify-identity-proof (proof credential-identity mls-signature-key)
@@ -135,7 +135,7 @@
     (unless (secp256k1-valid-xonly-p signer) (marmot-fail "identity proof: invalid signer key"))
     (unless (<= 1 created 9007199254740991) (marmot-fail "identity proof: bad created_at"))
     (unless (octets= signer credential-identity) (marmot-fail "identity proof: signer is not the credential identity"))
-    (let ((id (sha256 (string->utf8 (event-id-preimage (identity-proof-event signer created mls-signature-key))))))
+    (let ((id (hex->octets (compute-event-id (identity-proof-event signer created mls-signature-key)))))
       (unless (bip340-verify signer id sig) (marmot-fail "identity proof: bad signature")))
     t))
 

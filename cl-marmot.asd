@@ -3,6 +3,7 @@
 (asdf:defsystem #:cl-marmot
   :description "A Marmot protocol client: MLS (RFC 9420) group messaging over Nostr, in portable Common Lisp."
   :license "MIT"
+  :depends-on (#:natrium #:secp256k1-fast #:seal #:cl-nostr)
   :serial t
   :components
   ((:module "src"
@@ -19,14 +20,7 @@
      (:module "crypto"
       :serial t
       :components ((:file "conditions")
-                   (:file "sha2")
-                   (:file "sha1")
-                   (:file "hmac")
-                   (:file "chacha20")
-                   (:file "aes-gcm")
-                   (:file "x25519")
-                   (:file "ed25519")
-                   (:file "secp256k1")))
+                   (:file "bridge")))
      (:module "mls"
       :serial t
       :components ((:file "structs")
@@ -37,10 +31,7 @@
                    (:file "group")))
      (:module "nostr"
       :serial t
-      :components ((:file "event")
-                   (:file "nip44")
-                   (:file "websocket")
-                   (:file "relay")))
+      :components ((:file "event")))
      (:module "marmot"
       :serial t
       :components ((:file "components")
@@ -65,9 +56,3 @@
                  (:file "nostr-tests")
                  (:file "marmot-tests")
                  (:file "group-tests")))))
-
-;;; wss:// support through seal (pure-CL TLS 1.3, github.com/modus-lisp/seal),
-;;; which needs natrium.  Optional: plain ws:// works without it.
-(asdf:defsystem #:cl-marmot/wss
-  :depends-on (#:cl-marmot #:seal)
-  :components ((:module "src" :components ((:module "client" :components ((:file "wss")))))))

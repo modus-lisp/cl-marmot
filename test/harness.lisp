@@ -6,6 +6,7 @@
 
 (defpackage #:cl-marmot/test
   (:use #:common-lisp #:cl-marmot)
+  (:local-nicknames (#:ev #:cl-nostr.event) (#:nip44 #:cl-nostr.nip44))
   (:export #:run-tests #:deftest))
 
 (in-package #:cl-marmot/test)

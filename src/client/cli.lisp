@@ -107,7 +107,7 @@ State: $MARMOT_HOME/account.sexp (default ~/.local/share/cl-marmot/)
          (unwind-protect
               (progn (%cli-account-command acct cmd rest) 0)
            (%save acct)
-           (pool-close (account-pool acct))))))))
+           (close-account-pools acct)))))))
 
 (defun %cli-account-command (acct cmd args)
   ;; only `sync` and `watch` narrate incoming traffic; other commands sync quietly

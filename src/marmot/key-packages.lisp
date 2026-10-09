@@ -77,7 +77,7 @@ replacements of the same slot."
 
 (defun validate-key-package-event (ev &key (now (unix-time)))
   "transports/nostr.md + foundation/key-packages.md.  Returns the KeyPackage."
-  (unless (= (nostr-event-kind ev) 30443) (marmot-fail "not a KeyPackage event"))
+  (unless (= (ev:event-kind ev) 30443) (marmot-fail "not a KeyPackage event"))
   (unless (verify-event ev) (marmot-fail "KeyPackage event signature"))
   (let ((d (event-tag-value ev "d")))
     (unless (%lower-hex-p d 64) (marmot-fail "bad d tag")))
@@ -89,7 +89,7 @@ replacements of the same slot."
         (marmot-fail "duplicate values in ~A" name))))
   (unless (member "0x8009" (event-tag-values ev "app_components") :test #'string=)
     (marmot-fail "app_components does not list 0x8009"))
-  (let* ((msg (handler-case (tls-deserialize 'mls-message (base64->octets (nostr-event-content ev)))
+  (let* ((msg (handler-case (tls-deserialize 'mls-message (base64->octets (ev:event-content ev)))
                 (error (c) (marmot-fail "KeyPackage content: ~A" c))))
          (kp (mls-message-body msg)))
     (unless (= (mls-message-wire-format msg) +wf-key-package+) (marmot-fail "content is not mls_key_package"))
@@ -100,7 +100,7 @@ replacements of the same slot."
       (when (> (- (lifetime-not-after lt) (lifetime-not-before lt)) +kp-lifetime-max+)
         (marmot-fail "KeyPackage lifetime range too long"))
       (let ((identity (validate-marmot-leaf ln)))
-        (unless (string= (octets->hex identity) (nostr-event-pubkey ev))
+        (unless (string= (octets->hex identity) (ev:event-pubkey ev))
           (marmot-fail "KeyPackage credential is not the event author"))))
     (unless (string= (event-tag-value ev "i") (octets->hex (key-package-ref kp)))
       (marmot-fail "i tag does not match the KeyPackageRef"))

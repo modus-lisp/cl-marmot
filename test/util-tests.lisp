@@ -20,14 +20,18 @@
   (signals base64-error (base64->octets "Zm9v Yg==") "whitespace"))
 
 (deftest bech32-nip19 ()
+  ;; NIP-19 through cl-nostr's bech32
   ;; NIP-19 examples
   (is-equal "npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w6"
             (npub-encode (hex "3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d")))
   (is-hex "3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d"
-          (npub-decode "npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w6"))
+          (parse-pubkey "npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w6"))
   (is-equal "nsec1vl029mgpspedva04g90vltkh6fvh240zqtv9k0t9af8935ke9laqsnlfe5"
-            (nsec-encode (hex "67dea2ed018072d675f5415ecfaed7d2597555e202d85b3d65ea4e58d2d92ffa")))
-  (signals bech32-error (npub-decode "npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w7")))
+            (cl-nostr.bech32:nsec-encode (hex "67dea2ed018072d675f5415ecfaed7d2597555e202d85b3d65ea4e58d2d92ffa")))
+  (is-hex "67dea2ed018072d675f5415ecfaed7d2597555e202d85b3d65ea4e58d2d92ffa"
+          (nsec-decode "nsec1vl029mgpspedva04g90vltkh6fvh240zqtv9k0t9af8935ke9laqsnlfe5"))
+  (signals nostr-error (parse-pubkey "npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w7")
+           "bad checksum"))
 
 (deftest json-roundtrip ()
   (let ((v (parse-json "{\"a\":[1,-2,\"x\\n\\u00e9\\ud83d\\ude00\"],\"b\":true,\"c\":null,\"d\":{}}")))
