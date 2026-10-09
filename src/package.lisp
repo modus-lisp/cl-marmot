@@ -24,4 +24,5 @@
                     (#:nip44 #:cl-nostr.nip44)
                     (#:nip59 #:cl-nostr.nip59)
                     (#:pool #:cl-nostr.pool)
-                    (#:flt #:cl-nostr.filter)))
+                    (#:flt #:cl-nostr.filter)
+                    (#:nip05 #:cl-nostr.nip05)))

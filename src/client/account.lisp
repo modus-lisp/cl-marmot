@@ -61,12 +61,25 @@
       (marmot-fail "no relay accepted kind ~D: ~S" (ev:event-kind ev) results))
     results))
 
+(defparameter *lookup-relays* '("wss://purplepag.es" "wss://relay.damus.io" "wss://nos.lol"
+                                "wss://relay.primal.net")
+  "Directory relays for other accounts' relay lists, in addition to our own.
+Publication of our own relay lists also goes here so others can find them.
+Only used by accounts whose relays are all public (wss://): a local ws://
+setup (tests, development) never touches public infrastructure.")
+
+(defun %lookup-relays (acct)
+  (let ((own (account-relays acct)))
+    (if (and own (every (lambda (r) (and (> (length r) 6) (string-equal "wss://" r :end2 6))) own))
+        (remove-duplicates (append own *lookup-relays*) :test #'string=)
+        own)))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Account preparation (transports/nostr.md "Migration from kind 10051")
 
 (defun publish-relay-lists (acct)
-  (%publish acct (account-relays acct) (relay-list-event (account-sk acct) 10002 (account-relays acct)))
-  (%publish acct (account-relays acct) (relay-list-event (account-sk acct) 10050 (account-relays acct))))
+  (%publish acct (%lookup-relays acct) (relay-list-event (account-sk acct) 10002 (account-relays acct)))
+  (%publish acct (%lookup-relays acct) (relay-list-event (account-sk acct) 10050 (account-relays acct))))
 
 (defun publish-profile (acct name)
   (%publish acct (account-relays acct)
@@ -97,7 +110,7 @@
                                         (and (= (ev:event-created-at a) (ev:event-created-at b))
                                              (string< (ev:event-id a) (ev:event-id b))))))))
 
-(defun fetch-relay-list (acct pubkey-hex kind &key (lookup-relays (account-relays acct)))
+(defun fetch-relay-list (acct pubkey-hex kind &key (lookup-relays (%lookup-relays acct)))
   (let ((ev (%latest (remove-if-not (lambda (e) (string= (ev:event-pubkey e) pubkey-hex))
                                     (pool-query acct lookup-relays
                                                 (list (flt:make-filter :kinds (list kind) :authors (list pubkey-hex))))))))

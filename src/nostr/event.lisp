@@ -141,7 +141,10 @@ or does not have exactly one value."
 (defun nsec-decode (nsec) (coerce-octets (b32:nsec-decode nsec)))
 
 (defun parse-pubkey (string)
-  "An npub, nprofile or 64-hex pubkey, as 32 octets."
-  (let ((hex (handler-case (b32:pubkey-hex string) (error () nil))))
+  "An npub, nprofile, 64-hex pubkey or NIP-05 address (name@domain), as 32 octets."
+  (let ((hex (handler-case (if (find #\@ string)
+                               (nip05:resolve-pubkey string)
+                               (b32:pubkey-hex string))
+               (error () nil))))
     (unless (%lower-hex-p hex 64) (nostr-fail "not a public key: ~A" string))
     (hex->octets hex)))
