@@ -132,3 +132,15 @@
           (is-equal :removed (getf (first (%deliver b env)) :type))))
       (is-equal 1 (length (mls-group-members (marmot-group-mls a))))
       (is (null (pending-self-removes a)) "consumed proposals are gone in the new epoch"))))
+
+(deftest marmot-message-retention-tag ()
+  (let* ((sk (generate-nostr-key))
+         (a (create-marmot-group sk :name "r" :relays '("ws://127.0.0.1:1"))))
+    (is (null (event-tags-named (send-app-message a (secp256k1-xonly-pubkey sk) 9 "x") "expiration"))
+        "no tag while retention is off")
+    (stage-commit a :proposals (list (make-proposal :type +prop-app-data-update+ :component-id +c-message-retention+
+                                                    :operation 1 :data (encode-message-retention 3600))))
+    (merge-pending a)
+    (let* ((ev (send-app-message a (secp256k1-xonly-pubkey sk) 9 "y"))
+           (m (first (marmot-group-messages a))))
+      (is-equal (format nil "~D" (+ 3600 (getf m :created-at))) (event-tag-value ev "expiration")))))

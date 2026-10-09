@@ -44,6 +44,11 @@
   (let ((d (app-data-get (%gc-dict mls) +c-profile+)))
     (and d (decode-group-profile d))))
 
+(defun group-retention-secs (mls)
+  "Disappearing-message duration in seconds (0 = disabled or absent)."
+  (let ((d (app-data-get (%gc-dict mls) +c-message-retention+)))
+    (if d (decode-message-retention d) 0)))
+
 (defun group-required-components (mls)
   (let ((d (app-data-get (%gc-dict mls) +component-app-components+)))
     (and d (decode-component-id-list d))))
@@ -425,10 +430,15 @@ leaving leaf: the one with the lowest proposal digest."
   (when (marmot-group-leaving mg) (marmot-fail "we are leaving this group"))
   (let* ((mls (marmot-group-mls mg))
          (app (make-app-event account-pubkey kind content :tags tags))
-         (bytes (create-application-message mls (encode-app-event app))))
+         (bytes (create-application-message mls (encode-app-event app)))
+         (secs (group-retention-secs mls))
+         ;; message-retention-v1: exact u64 created_at + duration, else no tag
+         (expiry (and (plusp secs)
+                      (let ((e (+ (nostr-event-created-at app) secs)))
+                        (and (< e (expt 2 64)) e)))))
     (setf (gethash (octets->hex (sha256 bytes)) (marmot-group-seen mg)) t)
     (push (list :type :message :epoch (mls-group-epoch mls) :sender (nostr-event-pubkey app)
                 :kind kind :content content :tags tags :id (nostr-event-id app)
                 :created-at (nostr-event-created-at app) :own t)
           (marmot-group-messages mg))
-    (seal-group-message mls bytes)))
+    (seal-group-message mls bytes :expiration expiry)))

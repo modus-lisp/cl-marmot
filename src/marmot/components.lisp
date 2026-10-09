@@ -86,6 +86,14 @@
                       "group profile")
     (values (utf8->string name) (utf8->string desc))))
 
+;;; 0x8005 marmot.group.message-retention.v1
+
+(defun encode-message-retention (secs) (int->octets-be secs 8))
+
+(defun decode-message-retention (octets)
+  (unless (= (length octets) 8) (marmot-fail "message retention: not 8 bytes"))
+  (octets->int-be octets))
+
 ;;; 0x800c marmot.group.lifecycle.v1
 
 (defun encode-lifecycle (state) (octets (ecase state (:active 0) (:disbanded 1))))
