@@ -243,7 +243,9 @@ candidate parent MLS."
           ;; our own pending commit coming back
           ((and (marmot-group-pending mg)
                 (octets= bytes (staged-commit-message (marmot-group-pending mg))))
-           (list (list :type :own-commit-echo)))
+           ;; a relay has our pending commit: it was published, so it is canonical
+           (let ((staged (marmot-group-pending mg)))
+             (append (merge-pending mg) (list (list :type :own-commit-merged :staged staged)))))
           ((/= (mls-message-wire-format msg) +wf-private-message+)
            ;; handshake: only against the canonical state
            (unless (eq state (marmot-group-mls mg))
@@ -267,9 +269,10 @@ candidate parent MLS."
                             (%resolve-proposals state (getf r :commit) (getf r :sender)))))
                   (if why
                       (list (list :type :rejected :reason why))
-                      (handler-case (%apply-new-epoch mg (getf r :new-group)
-                                                      :commit (getf r :commit)
-                                                      :committer (getf r :sender))
+                      (handler-case (append (%apply-new-epoch mg (getf r :new-group)
+                                                              :commit (getf r :commit)
+                                                              :committer (getf r :sender))
+                                            (%drop-superseded-pending mg))
                         (marmot-error (c)
                           (list (list :type :rejected :reason (marmot-error-message c)))))))))))
           (t
@@ -392,13 +395,23 @@ the STAGED-COMMIT.  Marmot authorization is checked against the current state."
 
 (defun discard-pending (mg) (setf (marmot-group-pending mg) nil))
 
+(defun %drop-superseded-pending (mg)
+  "Another member's commit took the epoch our pending commit was built for:
+ours can never apply.  Returns a notification, or NIL."
+  (let ((staged (marmot-group-pending mg)))
+    (when (and staged
+               (<= (mls-group-epoch (staged-commit-new-group staged)) (mg-epoch mg)))
+      (setf (marmot-group-pending mg) nil)
+      (list (%note mg :type :pending-superseded :epoch (mg-epoch mg)
+                      :invitees (mapcar #'car (staged-commit-invitees staged)))))))
+
 (defun add-proposals-for (key-packages)
   (mapcar (lambda (kp) (make-proposal :type +prop-add+ :key-package kp)) key-packages))
 
-(defun welcome-rumor (account-pubkey staged kp-event-id relays)
+(defun welcome-rumor (account-pubkey welcome-octets kp-event-id relays)
   (make-unsigned-event :pubkey account-pubkey :kind 444
                        :tags (list (list "e" kp-event-id) (cons "relays" relays))
-                       :content (octets->base64 (staged-commit-welcome staged))))
+                       :content (octets->base64 welcome-octets)))
 
 (defun pending-self-removes (mg)
   "Retained SelfRemove proposals from other members (plists), at most one per

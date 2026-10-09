@@ -90,8 +90,21 @@
   ;; plists of strings/integers/keywords already; tags are lists of strings
   m)
 
+(defun %staged->sexp (st)
+  (and st (list :message (%h (staged-commit-message st))
+                :welcome (%h (staged-commit-welcome st))
+                :new-group (mls-group->sexp (staged-commit-new-group st))
+                :invitees (mapcar (lambda (c) (list (car c) (cdr c))) (staged-commit-invitees st)))))
+
+(defun %sexp->staged (s)
+  (and s (make-staged-commit :message (%o (getf s :message))
+                             :welcome (%o (getf s :welcome))
+                             :new-group (sexp->mls-group (getf s :new-group))
+                             :invitees (mapcar (lambda (l) (cons (first l) (second l))) (getf s :invitees)))))
+
 (defun marmot-group->sexp (mg)
   (list :mls (mls-group->sexp (marmot-group-mls mg))
+        :pending (%staged->sexp (marmot-group-pending mg))
         :retained (mapcar #'mls-group->sexp (marmot-group-retained mg))
         :seen (loop for k being the hash-keys of (marmot-group-seen mg) collect k)
         :messages (mapcar #'%message->sexp (marmot-group-messages mg))
@@ -105,7 +118,8 @@
                                :retained (mapcar #'sexp->mls-group (getf s :retained))
                                :messages (getf s :messages)
                                :log (getf s :log)
-                               :leaving (getf s :leaving))))
+                               :leaving (getf s :leaving)
+                               :pending (%sexp->staged (getf s :pending)))))
     (dolist (k (getf s :seen)) (setf (gethash k (marmot-group-seen mg)) t))
     mg))
 
@@ -126,7 +140,8 @@
         :groups (loop for mg being the hash-values of (account-groups acct) collect (marmot-group->sexp mg))
         :seen-wraps (loop for k being the hash-keys of (account-seen-wraps acct) collect k)
         :seen-group-events (loop for k being the hash-keys of (account-seen-group-events acct) collect k)
-        :last-sync (account-last-sync acct)))
+        :last-sync (account-last-sync acct)
+        :outbox (account-outbox acct)))
 
 (defun sexp->account (s)
   (unless (eql (getf s :version) 1) (error "unknown account file version ~S" (getf s :version)))
@@ -144,7 +159,8 @@
         (setf (gethash (mg-id-hex mg) (account-groups acct)) mg)))
     (dolist (k (getf s :seen-wraps)) (setf (gethash k (account-seen-wraps acct)) t))
     (dolist (k (getf s :seen-group-events)) (setf (gethash k (account-seen-group-events acct)) t))
-    (setf (account-last-sync acct) (or (getf s :last-sync) 0))
+    (setf (account-last-sync acct) (or (getf s :last-sync) 0)
+          (account-outbox acct) (getf s :outbox))
     acct))
 
 (defun chmod-private (path)

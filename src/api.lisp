@@ -78,7 +78,9 @@
       ;; holding the lock proves nobody is serving: a socket file here is a leftover
       (when (probe-file (socket-path home)) (ignore-errors (delete-file (socket-path home))))
       (let ((client (%make-client :account (funcall make-account home) :home home :lock-file lock)))
-        (setf (cl-marmot::account-on-event (client-account client)) nil)
+        (setf (cl-marmot::account-on-event (client-account client)) nil
+              ;; commits and Welcomes are saved before they are published
+              (cl-marmot::account-checkpoint (client-account client)) (lambda () (%save client)))
         client))))
 
 (defun create-account (&key (home (default-home)) relays name nsec)
@@ -179,6 +181,7 @@ KeyPackage to RELAYS.  NSEC imports an existing key.  Returns an open CLIENT."
 
 (defstruct (event (:constructor %make-event))
   type          ; :message :joined :member-added :member-removed :renamed :removed :epoch :rejected
+                ; :pending-superseded (another member's commit took the epoch ours was for)
   chat          ; the chat object
   message       ; a MESSAGE, for :message
   account       ; hex pubkey, for :member-added / :member-removed
@@ -186,7 +189,7 @@ KeyPackage to RELAYS.  NSEC imports an existing key.  Returns an open CLIENT."
 
 (defun %event (chat r)
   (let ((type (getf r :type)))
-    (unless (member type '(:duplicate :undecryptable :stale :own-commit-echo :proposal))
+    (unless (member type '(:duplicate :undecryptable :stale :own-commit-merged :proposal))
       (%make-event :type type :chat chat
                    :message (and (eq type :message) (%message chat r))
                    :account (let ((a (getf r :account))) (and a (cl-marmot::octets->hex a)))

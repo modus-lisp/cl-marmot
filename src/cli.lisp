@@ -47,6 +47,9 @@ State: $MARMOT_HOME/account.sexp (default ~/.local/share/cl-marmot/)
       (:member-removed (%out "[~A] - ~A~%" (%label chat) (%npub (event-account e))))
       (:renamed (%out "[~A] renamed to ~S~%" (%label chat) (getf (event-detail e) :name)))
       (:removed (%out "[~A] you were removed~%" (%label chat)))
+      (:pending-superseded (%out "[~A] another member's commit took epoch ~D; ours was dropped~@[ (re-invite ~{~A~^, ~})~]~%"
+                                 (%label chat) (getf (event-detail e) :epoch)
+                                 (mapcar #'%npub (getf (event-detail e) :invitees))))
       (:rejected (%out "[~A] rejected input: ~A~%" (%label chat) (getf (event-detail e) :reason)))
       (t (%out "[~A] ~S~%" (%label chat) (event-detail e))))))
 

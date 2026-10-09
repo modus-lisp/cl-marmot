@@ -144,3 +144,55 @@
     (let* ((ev (send-app-message a (secp256k1-xonly-pubkey sk) 9 "y"))
            (m (first (marmot-group-messages a))))
       (is-equal (format nil "~D" (+ 3600 (getf m :created-at))) (event-tag-value ev "expiration")))))
+
+(defun %roundtrip-group (mg)
+  "Save and restore a MARMOT-GROUP through the account store's encoding."
+  (sexp->marmot-group (read-from-string (with-standard-io-syntax
+                                          (let ((*package* (find-package '#:cl-marmot)))
+                                            (prin1-to-string (marmot-group->sexp mg)))))))
+
+(deftest marmot-pending-commit-survives-restart ()
+  ;; publish-lifecycle.md "Restart": a commit saved as pending before it was
+  ;; published must become canonical when its bytes come back from a relay,
+  ;; even in a fresh process
+  (let* ((alice-sk (generate-nostr-key)) (bob-sk (generate-nostr-key))
+         (bob-kp (make-marmot-key-package bob-sk))
+         (a (create-marmot-group alice-sk :name "d" :relays '("ws://127.0.0.1:1")))
+         (st (stage-commit a :proposals (add-proposals-for (list (key-package-bundle-key-package bob-kp))))))
+    (merge-pending a)
+    (let ((b (join-marmot-group (mls-message-body (tls-deserialize 'mls-message (staged-commit-welcome st))) bob-kp)))
+      (stage-commit a :proposals (list (make-proposal :type +prop-app-data-update+ :component-id +c-profile+
+                                                      :operation 1 :data (encode-group-profile "renamed" ""))))
+      (let* ((env (%commit-envelope a))
+             (restarted (%roundtrip-group a)))
+        (is (marmot-group-pending restarted) "the pending commit was saved")
+        (is-equal 1 (mg-epoch restarted) "and is not yet canonical")
+        (let ((r (%deliver restarted env)))
+          (is (find :own-commit-merged r :key (lambda (x) (getf x :type))) "its echo merges it"))
+        (is-equal 2 (mg-epoch restarted))
+        (is-equal "renamed" (mg-name restarted))
+        (is (null (marmot-group-pending restarted)))
+        ;; and the other member agrees
+        (%deliver b env)
+        (is (octets= (epoch-secrets-epoch-authenticator (mls-group-secrets (marmot-group-mls restarted)))
+                     (epoch-secrets-epoch-authenticator (mls-group-secrets (marmot-group-mls b)))))))))
+
+(deftest marmot-pending-commit-superseded ()
+  ;; two members self-update at the same epoch; the commit applied first wins
+  ;; locally, and the other's pending commit is dropped and reported
+  (let* ((alice-sk (generate-nostr-key)) (bob-sk (generate-nostr-key))
+         (bob-kp (make-marmot-key-package bob-sk))
+         (a (create-marmot-group alice-sk :name "s" :relays '("ws://127.0.0.1:1"))))
+    (let ((st (stage-commit a :proposals (add-proposals-for (list (key-package-bundle-key-package bob-kp))))))
+      (merge-pending a)
+      (let ((b (join-marmot-group (mls-message-body (tls-deserialize 'mls-message (staged-commit-welcome st))) bob-kp)))
+        (stage-commit a)
+        (stage-commit b)
+        (let ((alice-env (%commit-envelope a)))
+          (merge-pending a)
+          (let ((r (%deliver b alice-env)))
+            (is (find :pending-superseded r :key (lambda (x) (getf x :type))) "bob is told his commit lost"))
+          (is (null (marmot-group-pending b)))
+          (is-equal (mg-epoch a) (mg-epoch b))
+          (is-equal '("after the race") (%message-texts (%deliver b (send-app-message a (secp256k1-xonly-pubkey alice-sk)
+                                                                                     9 "after the race")))))))))

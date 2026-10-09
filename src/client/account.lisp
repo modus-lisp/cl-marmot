@@ -17,7 +17,14 @@
   (seen-wraps (make-hash-table :test #'equal))
   (seen-group-events (make-hash-table :test #'equal))
   (last-sync 0)
+  (outbox '())                         ; Welcome deliveries still owed (plists), see QUEUE-WELCOMES
+  (checkpoint nil)                     ; (lambda ()) that saves the account; called before publishing
   (on-event nil))                      ; (lambda (account group result)) for UIs
+
+(defun %checkpoint (acct)
+  "Persist the account now: a commit or Welcome must be on disk before its
+bytes can be on the wire (publish-lifecycle.md 'Restart')."
+  (when (account-checkpoint acct) (funcall (account-checkpoint acct))))
 
 (defun account-pubkey-hex (acct) (octets->hex (account-pubkey acct)))
 (defun account-npub (acct) (npub-encode (account-pubkey acct)))
@@ -217,6 +224,9 @@ setup (tests, development) never touches public infrastructure.")
         ;; undecryptable input may become readable after a later commit: keep it eligible
         (unless (equal results '((:type :undecryptable)))
           (setf (gethash (ev:event-id ev) (account-seen-group-events acct)) t))
+        (dolist (r results)
+          (when (eq (getf r :type) :own-commit-merged)
+            (queue-welcomes acct mg (getf r :staged))))
         (when (account-on-event acct)
           (dolist (r results) (funcall (account-on-event acct) acct mg r)))
         results))))
@@ -227,6 +237,8 @@ results produced."
   (let ((results '())
         (since (max 0 (- (account-last-sync acct) (* 3 24 3600)))))  ; gift wraps are back-dated
     (setf (account-last-sync acct) (unix-time))
+    (retry-pending-commits acct)
+    (flush-outbox acct)
     (dolist (wrap (pool-query acct (account-relays acct)
                               (list (flt:make-filter :kinds '(1059) :tags (list (cons "p" (list (account-pubkey-hex acct))))
                                                      :since since))))
@@ -252,57 +264,104 @@ results produced."
 ;;; ---------------------------------------------------------------------------
 ;;; Outbound
 
-(defun %send-welcomes (acct mg staged invitees)
-  "INVITEES: list of (pubkey-hex . kp-event).  Each Welcome is a separate
-delivery to that invitee's inbox relays."
-  (loop for (pk . kp-ev) in invitees
-        collect (let* ((inbox (or (fetch-relay-list acct pk 10050) (account-relays acct)))
-                       (rumor (welcome-rumor (account-pubkey acct) staged (ev:event-id kp-ev) (mg-relays mg)))
-                       (wrap (gift-wrap rumor (account-sk acct) pk)))
-                  (list pk (publish-accepted-p (%publish acct inbox wrap :require nil))))))
+;;; Welcome delivery is an outbox: each invitee's Welcome is recorded (and
+;;; saved) when its commit becomes canonical, then delivered and retried
+;;; independently until a relay in the invitee's inbox set accepts it.
+
+(defun queue-welcomes (acct mg staged)
+  (when (and staged (staged-commit-welcome staged) (staged-commit-invitees staged))
+    (loop for (pk . kp-event-id) in (staged-commit-invitees staged)
+          do (push (list :group (mg-id-hex mg) :pubkey pk :kp-event-id kp-event-id
+                         :welcome (octets->hex (staged-commit-welcome staged))
+                         :relays (mg-relays mg) :attempts 0)
+                   (account-outbox acct)))
+    (%checkpoint acct)
+    (flush-outbox acct)))
+
+(defun flush-outbox (acct)
+  "Try every owed Welcome once.  Returns the list of (pubkey delivered-p)."
+  (let ((results '()))
+    (dolist (entry (reverse (account-outbox acct)))
+      (let* ((pk (getf entry :pubkey))
+             (ok (handler-case
+                     (let* ((inbox (or (fetch-relay-list acct pk 10050) (account-relays acct)))
+                            (rumor (welcome-rumor (account-pubkey acct) (hex->octets (getf entry :welcome))
+                                                  (getf entry :kp-event-id) (getf entry :relays))))
+                       (publish-accepted-p (%publish acct inbox (gift-wrap rumor (account-sk acct) pk) :require nil)))
+                   (error () nil))))
+        (if ok
+            (setf (account-outbox acct) (remove entry (account-outbox acct)))
+            (incf (getf entry :attempts)))
+        (push (list pk ok) results)))
+    (nreverse results)))
+
+(defun %invitees (acct invitee-pubkeys)
+  "Resolve and fetch a KeyPackage for each invitee: list of (pubkey-hex . kp-event)."
+  (mapcar (lambda (pk)
+            (let ((hex (octets->hex (parse-pubkey pk))))
+              (cons hex (nth-value 1 (fetch-key-package acct hex)))))
+          invitee-pubkeys))
+
+(defun %stage-adds (mg invitees)
+  (let ((staged (stage-commit mg :proposals (add-proposals-for
+                                             (mapcar (lambda (i) (validate-key-package-event (cdr i)))
+                                                     invitees)))))
+    (setf (staged-commit-invitees staged)
+          (mapcar (lambda (i) (cons (car i) (ev:event-id (cdr i)))) invitees))
+    staged))
 
 (defun create-group-with (acct name invitee-pubkeys &key (description "") relays)
   "Founding creation (publish-lifecycle.md 'Group creation'): epoch 0, then a
 locally merged founding Add commit, then one Welcome per invitee."
-  (let* ((invitees (mapcar (lambda (pk)
-                             (let ((hex (octets->hex (parse-pubkey pk))))
-                               (cons hex (nth-value 1 (fetch-key-package acct hex)))))
-                           invitee-pubkeys))
+  (let* ((invitees (%invitees acct invitee-pubkeys))
          (mg (create-marmot-group (account-sk acct) :name name :description description
                                                      :relays (or relays (account-relays acct)))))
     (setf (gethash (mg-id-hex mg) (account-groups acct)) mg)
     (when invitees
-      (let ((staged (stage-commit mg :proposals (add-proposals-for
-                                                 (mapcar (lambda (i) (validate-key-package-event (cdr i)))
-                                                         invitees)))))
-        (merge-pending mg)
-        (%send-welcomes acct mg staged invitees)))
+      (let ((staged (%stage-adds mg invitees)))
+        (merge-pending mg)              ; founding: an empty publish obligation
+        (queue-welcomes acct mg staged)))
+    (%checkpoint acct)
     mg))
 
-(defun publish-commit (acct mg)
-  "Publish the pending commit to the group's (pre-commit) relays; merge on
-acknowledgement, discard otherwise.  Returns the relay results."
+(defun %publish-pending (acct mg)
+  "One attempt at the pending commit's publish obligation.  Returns the relay
+results; on an acknowledgement the commit is merged and its Welcomes queued."
   (let* ((staged (marmot-group-pending mg))
          (ev (seal-group-message (marmot-group-mls mg) (staged-commit-message staged)))
          (results (%publish acct (mg-relays mg) ev :require nil)))
     (setf (gethash (ev:event-id ev) (account-seen-group-events acct)) t)
-    (if (publish-accepted-p results)
-        (merge-pending mg)
-        (progn (discard-pending mg) (marmot-fail "commit not accepted by any relay: ~S" results)))
+    (when (publish-accepted-p results)
+      (merge-pending mg)
+      (%checkpoint acct)
+      (queue-welcomes acct mg staged))
     results))
+
+(defun publish-commit (acct mg)
+  "Publish the pending commit to the group's (pre-commit) relays.  It is saved
+first; if no relay acknowledges it, it stays pending (the bytes may already be
+out) and every sync republishes the same MLS bytes until it is acknowledged,
+echoed back, or superseded by another member's commit."
+  (%checkpoint acct)
+  (let ((results (%publish-pending acct mg)))
+    (unless (publish-accepted-p results)
+      (marmot-fail "no relay acknowledged the commit (~{~A~^; ~}); it is saved and will be republished on the next sync"
+                   (mapcar (lambda (r) (format nil "~A: ~A" (first r) (or (third r) "no reply"))) results)))
+    results))
+
+(defun retry-pending-commits (acct)
+  (loop for mg being the hash-values of (account-groups acct)
+        for staged = (marmot-group-pending mg)
+        when staged
+          do (if (= (mls-group-epoch (staged-commit-new-group staged)) (1+ (mg-epoch mg)))
+                 (handler-case (%publish-pending acct mg) (error () nil))
+                 (discard-pending mg))))
 
 (defun invite (acct mg invitee-pubkeys)
   (unless (active-admin-p (marmot-group-mls mg) (account-pubkey acct))
     (marmot-fail "only an active admin may invite"))
-  (let* ((invitees (mapcar (lambda (pk)
-                             (let ((hex (octets->hex (parse-pubkey pk))))
-                               (cons hex (nth-value 1 (fetch-key-package acct hex)))))
-                           invitee-pubkeys))
-         (staged (stage-commit mg :proposals (add-proposals-for
-                                              (mapcar (lambda (i) (validate-key-package-event (cdr i)))
-                                                      invitees)))))
-    (publish-commit acct mg)
-    (%send-welcomes acct mg staged invitees)))
+  (%stage-adds mg (%invitees acct invitee-pubkeys))
+  (publish-commit acct mg))
 
 (defun remove-members (acct mg pubkeys)
   (let* ((mls (marmot-group-mls mg))

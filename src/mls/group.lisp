@@ -314,7 +314,8 @@ or (as RFC 9420 allows for the creator) any source."
   welcome                 ; MLSMessage octets (Welcome) or NIL
   group-info              ; GroupInfo struct for the new epoch
   new-group               ; the MLS-GROUP to install once published
-  joiners)                ; list of (leaf-index . key-package)
+  joiners                 ; list of (leaf-index . key-package)
+  invitees)               ; Marmot: list of (pubkey-hex . kp-event-id) owed a Welcome
 
 (defun %derive-path (path-secret-0 n)
   "N path secrets starting from PATH-SECRET-0, and the commit secret."
