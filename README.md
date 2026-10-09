@@ -13,7 +13,7 @@ and Modus provides as a compatibility surface.
 ## Status
 
 It interoperates with mdk's `wn`, the engine whitenoise-linux links through `marmot-c`
-(`test/interop/run-wn-interop.sh`, **21 of 21** steps, fresh relay and accounts each run):
+(`test/interop/run-wn-interop.sh`, **22 of 22** steps, fresh relay and accounts each run):
 
 | | |
 |---|---|
@@ -24,6 +24,7 @@ It interoperates with mdk's `wn`, the engine whitenoise-linux links through `mar
 | invite a second `wn` account with a published Add commit + Welcome | ✓ |
 | remove a member; the removed member cannot read later messages | ✓ |
 | SelfRemove both ways: `wn` leaves and we commit it; we hand over admin, leave, and `wn` commits it | ✓ |
+| rotate the KeyPackage a Welcome consumed; `wn` invites us again with the replacement | ✓ |
 
 The MLS layer passes the MLS working group's interop vectors for cipher suite 1 — crypto-basics, tree-math,
 secret-tree, key-schedule, psk_secret, transcript-hashes, tree-validation, tree-operations, treekem,
@@ -32,7 +33,7 @@ proposals, and every commit-handling vector including PSKs). The crypto layer pa
 primitive (FIPS 180, RFC 4231/5869/8439/7748/8032, McGrew–Viega GCM, all 19 BIP-340 rows, all NIP-44 v2 vectors).
 
 ```
-./run-tests.sh                 # 53 tests, 10,950 checks
+./run-tests.sh                 # 54 tests, 10,952 checks
 WN_BIN=/path/to/wn-dir test/interop/run-wn-interop.sh
 ```
 
@@ -68,12 +69,11 @@ test/         unit tests, MLS/NIP-44 vectors, wn interop harness
 
 ## Not done yet
 
-- **TLS.** Only `ws://` relays work out of the box; `wss://` needs a TLS 1.3 client, which is not written yet.
-  `*tls-connect-function*` is the hook for one.
+- **TLS** comes from [seal](https://github.com/modus-lisp/seal), the pure-CL TLS 1.3 client (system
+  `cl-marmot/wss`; `bin/marmot` loads it when seal and natrium are found, see `MODUS_LISP`). Without it only `ws://`
+  relays work.
 - **Convergence** is linear: the first valid commit for an epoch wins. The spec's same-epoch race resolution,
   rollback horizon and retained-history replay (`protocol-core/convergence.md`) are not implemented.
 - **Encrypted media** (MIP-04 / `encrypted-media-v2`), Blossom images, push notifications, NIP-46 remote signers,
   message retention expiry tags, disbanding, and agent text streams beyond the receive-role fallback.
 - **Constant time.** The bignum elliptic-curve code and table-driven AES are not constant time.
-- Fresh-KeyPackage rotation after a Welcome consumes a single-use package (we publish last-resort packages, which
-  remain valid).
