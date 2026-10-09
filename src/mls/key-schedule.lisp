@@ -57,7 +57,7 @@
 (defun mls-exporter (exporter-secret label context length)
   "§8.5 MLS-Exporter.  LABEL and CONTEXT may be strings or octets."
   (flet ((b (x) (if (stringp x) (string->utf8 x) x)))
-    (expand-with-label (derive-secret exporter-secret (utf8->string (b label)))
+    (expand-with-label (derive-secret exporter-secret (b label))
                        "exported" (mls-hash (b context)) length)))
 
 ;;; ---------------------------------------------------------------------------

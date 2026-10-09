@@ -43,4 +43,5 @@
     :serial t
     :components ((:file "harness")
                  (:file "crypto-tests")
-                 (:file "util-tests")))))
+                 (:file "util-tests")
+                 (:file "mls-vector-tests")))))

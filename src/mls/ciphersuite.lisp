@@ -20,7 +20,9 @@
 (defparameter +mls-label-prefix+ "MLS 1.0 ")
 
 (defun %mls-label (label)
-  (string->utf8 (concatenate 'string +mls-label-prefix+ label)))
+  "\"MLS 1.0 \" + LABEL; LABEL may be a string or raw octets (exporter labels)."
+  (concat-octets (string->utf8 +mls-label-prefix+)
+                 (if (stringp label) (string->utf8 label) label)))
 
 ;;; RFC 9420 §8: ExpandWithLabel / DeriveSecret
 

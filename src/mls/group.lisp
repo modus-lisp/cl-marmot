@@ -20,6 +20,8 @@
   interim-hash
   confirmation-tag
   (proposals '())         ; received standalone proposals this epoch: list of plists
+  (external-psks '())     ; alist: psk-id octets -> psk octets
+  (resumption-psks '())   ; alist: epoch -> resumption psk (this group)
   (active t))             ; NIL once we have been removed
 
 (defun mls-group-id (g) (group-context-group-id (mls-group-context g)))
@@ -182,7 +184,8 @@ or (as RFC 9420 allows for the creator) any source."
   (joiners '())           ; list of (leaf-index . key-package)
   (removed '())           ; leaf indices removed
   path-required
-  self-removed)
+  self-removed
+  (psks '()))             ; PreSharedKeyIDs, in list order
 
 (defun %proposal-requires-path (p)
   (member (proposal-type p)
@@ -204,7 +207,12 @@ or (as RFC 9420 allows for the creator) any source."
     (when (and (funcall by-type +prop-reinit+) (> (length proposals) 1))
       (mls-fail "ReInit with other proposals"))
     (when (funcall by-type +prop-reinit+) (mls-fail "ReInit is not supported"))
-    (when (funcall by-type +prop-psk+) (mls-fail "PreSharedKey proposals are not supported"))
+    (let ((ids (mapcar (lambda (ps) (tls-serialize 'pre-shared-key-id (proposal-psk (car ps))))
+                       (funcall by-type +prop-psk+))))
+      (unless (= (length ids) (length (remove-duplicates ids :test #'octets=)))
+        (mls-fail "duplicate PreSharedKey proposals"))
+      (setf (applied-psks result) (mapcar (lambda (ps) (proposal-psk (car ps)))
+                                          (funcall by-type +prop-psk+))))
     ;; 1. GroupContextExtensions
     (let ((gce (first (funcall by-type +prop-group-context-extensions+))))
       (when gce (setf extensions (proposal-extensions (car gce)))))
@@ -271,6 +279,26 @@ or (as RFC 9420 allows for the creator) any source."
           (unless (%leaf-supports-required (rt-leaf tree i) rc)
             (mls-fail "member ~D does not support required capabilities" i)))))
     result))
+
+(defun %lookup-psk (g id)
+  (ecase (pre-shared-key-id-type id)
+    (1 (or (cdr (assoc (pre-shared-key-id-psk-id id) (mls-group-external-psks g) :test #'octets=))
+           (mls-fail "unknown external PSK")))
+    (2 (unless (octets= (pre-shared-key-id-group-id id) (mls-group-id g))
+         (mls-fail "resumption PSK from another group"))
+       (or (cdr (assoc (pre-shared-key-id-epoch id) (mls-group-resumption-psks g)))
+           (mls-fail "unknown resumption PSK epoch ~D" (pre-shared-key-id-epoch id))))))
+
+(defun %psk-secret-for (g ids)
+  (psk-secret (mapcar (lambda (id) (cons id (%lookup-psk g id))) ids)))
+
+(defun %carry-psk-state (old new)
+  "NEW inherits OLD's PSK stores, plus OLD's own resumption secret."
+  (setf (mls-group-external-psks new) (mls-group-external-psks old)
+        (mls-group-resumption-psks new)
+        (acons (mls-group-epoch old) (epoch-secrets-resumption-psk (mls-group-secrets old))
+               (mls-group-resumption-psks old)))
+  new)
 
 (defun %extensions-put (extensions ext)
   "Replace an extension of the same type in place, or append (openmls add_or_replace)."
@@ -396,7 +424,8 @@ Returns a STAGED-COMMIT; G itself is not modified."
                                          commit-secret new-gc-octets))
              (new (make-mls-group :context new-gc :tree tree :own-leaf own
                                   :sig-sk (mls-group-sig-sk g) :node-sks new-sks)))
-        (%init-epoch new joiner (zero-secret))
+        (%carry-psk-state g new)
+        (%init-epoch new joiner (%psk-secret-for g (applied-psks applied)))
         (let* ((tag (mls-mac (epoch-secrets-confirmation-key (mls-group-secrets new)) confirmed))
                (auth (make-auth-data :signature signature :confirmation-tag tag))
                (pm (make-public-message
@@ -407,7 +436,8 @@ Returns a STAGED-COMMIT; G itself is not modified."
                 (mls-group-interim-hash new) (interim-transcript-hash-next confirmed tag))
           (let* ((gi (make-group-info-for new))
                  (welcome (and (applied-joiners applied)
-                               (%make-welcome new gi (applied-joiners applied) fdp path-secrets))))
+                               (%make-welcome new gi (applied-joiners applied) fdp path-secrets
+                                               (applied-psks applied)))))
             (make-staged-commit
              :message (mls-message-octets +wf-public-message+ pm)
              :welcome (and welcome (mls-message-octets +wf-welcome+ welcome))
@@ -428,7 +458,7 @@ Returns a STAGED-COMMIT; G itself is not modified."
           (sign-with-label (mls-group-sig-sk g) "GroupInfoTBS" (group-info-tbs gi)))
     gi))
 
-(defun %make-welcome (new gi joiners fdp path-secrets)
+(defun %make-welcome (new gi joiners fdp path-secrets psks)
   (multiple-value-bind (key nonce) (welcome-key-nonce (epoch-secrets-welcome-secret (mls-group-secrets new)))
     (let ((egi (mls-aead-encrypt key nonce (tls-serialize 'group-info gi) (make-octets 0))))
       (make-welcome
@@ -440,7 +470,7 @@ Returns a STAGED-COMMIT; G itself is not modified."
                             (gs (make-group-secrets
                                  :joiner-secret (epoch-secrets-joiner-secret (mls-group-secrets new))
                                  :path-secret (and lca-pos (nth lca-pos path-secrets))
-                                 :psks '())))
+                                 :psks psks)))
                        (make-encrypted-group-secrets
                         :new-member (key-package-ref kp)
                         :encrypted-group-secrets
@@ -480,13 +510,63 @@ Returns a STAGED-COMMIT; G itself is not modified."
         (mls-fail "bad signature"))
       leaf)))
 
-(defun process-commit (g pm &key (wire-format +wf-public-message+))
-  "Process a verified-or-unverified PublicMessage commit; returns the new group.
-G is not modified."
-  (declare (ignore wire-format))
+(defun merge-update-path (tree committer path)
+  "Merge PATH (an UPDATE-PATH from COMMITTER) into TREE in place: blank the
+direct path, install the new parent keys and leaf, and check the leaf's parent
+hash.  Returns the filtered direct path as (parent . copath-child) pairs."
+  (let ((ln (update-path-leaf-node path)))
+    (rt-blank-path tree committer)
+    (let ((fdp (rt-filtered-direct-path-with-copath tree committer)))
+      (unless (= (length fdp) (length (update-path-nodes path)))
+        (mls-fail "UpdatePath length ~D, filtered direct path ~D"
+                  (length (update-path-nodes path)) (length fdp)))
+      (loop for (p . nil) in fdp
+            for upn in (update-path-nodes path)
+            do (setf (rt-node tree p) (make-parent-node
+                                       :encryption-key (update-path-node-encryption-key upn)
+                                       :parent-hash (make-octets 0) :unmerged-leaves '())))
+      (setf (rt-node tree (* 2 committer)) ln)
+      (let ((expected (rt-set-path-parent-hashes tree committer)))
+        (unless (and (leaf-node-parent-hash ln) (octets= expected (leaf-node-parent-hash ln)))
+          (mls-fail "parent hash mismatch")))
+      fdp)))
+
+(defun decrypt-update-path (tree own fdp path node-sks context-octets joiner-leaves)
+  "Decrypt the path secret meant for leaf OWN.  NODE-SKS maps node -> private
+key (pre-commit).  Returns (values alist-of-(node . sk) commit-secret
+path-secret-at-first-node-we-share)."
+  (when (null fdp) (return-from decrypt-update-path (values '() nil nil)))
+  (let ((pos (position-if (lambda (pc) (tm-is-ancestor (cdr pc) (* 2 own))) fdp)))
+    (unless pos (mls-fail "no path node covers our leaf"))
+    (let* ((copath (cdr (nth pos fdp)))
+           (res (rt-resolution tree copath :exclude-leaves joiner-leaves))
+           (ri (position-if (lambda (r) (gethash r node-sks)) res))
+           (cts (update-path-node-encrypted-path-secret (nth pos (update-path-nodes path)))))
+      (unless ri (mls-fail "no private key in the copath resolution"))
+      (unless (= (length cts) (length res)) (mls-fail "ciphertext count mismatch"))
+      (let* ((ps (decrypt-with-label (gethash (nth ri res) node-sks) "UpdatePathNode"
+                                     context-octets (nth ri cts)))
+             (first-ps ps)
+             (keys '()))
+        (loop for (p . nil) in (nthcdr pos fdp)
+              do (multiple-value-bind (nsk npk) (%node-key-pair ps)
+                   (unless (octets= npk (parent-node-encryption-key (rt-node tree p)))
+                     (mls-fail "derived path key mismatch at node ~D" p))
+                   (push (cons p nsk) keys))
+                 (setf ps (derive-secret ps "path")))
+        (values (nreverse keys) ps first-ps)))))
+
+(defun process-commit (g pm)
+  "Verify and process a PublicMessage commit; returns the new group.  G is
+not modified."
   (%verify-public-message g pm)
-  (let* ((fc (public-message-content pm))
-         (committer (sender-index (framed-content-sender fc)))
+  (process-commit-content g (public-message-content pm) (public-message-auth pm)
+                          +wf-public-message+))
+
+(defun process-commit-content (g fc auth wire-format)
+  "Process commit content FC/AUTH whose signature (and membership tag, for a
+PublicMessage) has already been verified."
+  (let* ((committer (sender-index (framed-content-sender fc)))
          (commit (framed-content-commit fc))
          (proposals (%resolve-proposals g commit committer))
          (applied (apply-proposals g proposals committer))
@@ -497,68 +577,36 @@ G is not modified."
          (new-sks (make-hash-table))
          (commit-secret (zero-secret)))
     (when (and (applied-path-required applied) (null path)) (mls-fail "commit requires a path"))
-    (if (applied-self-removed applied)
-        ;; we are out: return an inactive copy
-        (let ((out (copy-mls-group g)))
-          (setf (mls-group-active out) nil)
-          (return-from process-commit out))
-        (maphash (lambda (k v) (setf (gethash k new-sks) v)) (mls-group-node-sks g)))
+    (when (applied-self-removed applied)
+      (let ((out (copy-mls-group g)))
+        (setf (mls-group-active out) nil)
+        (return-from process-commit-content out)))
+    (maphash (lambda (k v) (setf (gethash k new-sks) v)) (mls-group-node-sks g))
     (when path
       (let ((ln (update-path-leaf-node path)))
         (unless (= (leaf-node-source ln) +lns-commit+) (mls-fail "path leaf source"))
         (unless (verify-leaf-node-signature ln :group-id (mls-group-id g) :leaf-index committer)
           (mls-fail "path leaf signature"))
         (validate-leaf-for-group ln (applied-extensions applied) tree :replacing-leaf committer)
-        ;; merge
-        (rt-blank-path tree committer)
-        (let ((fdp (rt-filtered-direct-path-with-copath tree committer))
-              (joiner-leaves (mapcar #'car (applied-joiners applied))))
-          (unless (= (length fdp) (length (update-path-nodes path)))
-            (mls-fail "UpdatePath length ~D, filtered direct path ~D"
-                      (length (update-path-nodes path)) (length fdp)))
-          (loop for (p . nil) in fdp
-                for upn in (update-path-nodes path)
-                do (setf (rt-node tree p) (make-parent-node
-                                           :encryption-key (update-path-node-encryption-key upn)
-                                           :parent-hash (make-octets 0) :unmerged-leaves '())))
-          (setf (rt-node tree (* 2 committer)) ln)
-          (let ((expected (rt-set-path-parent-hashes tree committer)))
-            (unless (octets= expected (leaf-node-parent-hash ln)) (mls-fail "parent hash mismatch")))
-          ;; drop our keys for nodes the path blanked or replaced
+        (let ((fdp (merge-update-path tree committer path)))
           (dolist (p (tm-direct-path (* 2 committer) (rt-n-leaves tree)))
             (remhash p new-sks))
-          ;; decrypt our path secret
           (when fdp
-            (let* ((provisional (copy-group-context-with old-gc
-                                                         :epoch (1+ (group-context-epoch old-gc))
-                                                         :tree-hash (rt-tree-hash tree)
-                                                         :extensions (applied-extensions applied)))
-                   (ctx (group-context-octets provisional))
-                   (pos (position-if (lambda (pc) (tm-is-ancestor (cdr pc) (* 2 own))) fdp)))
-              (unless pos (mls-fail "no path node covers our leaf"))
-              (let* ((copath (cdr (nth pos fdp)))
-                     (res (rt-resolution tree copath :exclude-leaves joiner-leaves))
-                     (ri (position-if (lambda (r) (gethash r (mls-group-node-sks g))) res))
-                     (_ (unless ri (mls-fail "no private key in the copath resolution")))
-                     (sk (gethash (nth ri res) (mls-group-node-sks g)))
-                     (cts (update-path-node-encrypted-path-secret (nth pos (update-path-nodes path))))
-                     (ps (decrypt-with-label sk "UpdatePathNode" ctx (nth ri cts))))
-                (declare (ignore _))
-                (unless (= (length cts) (length res)) (mls-fail "ciphertext count mismatch"))
-                (loop for (p . nil) in (nthcdr pos fdp)
-                      for i from pos
-                      do (multiple-value-bind (nsk npk) (%node-key-pair ps)
-                           (unless (octets= npk (parent-node-encryption-key (rt-node tree p)))
-                             (mls-fail "derived path key mismatch at node ~D" p))
-                           (setf (gethash p new-sks) nsk))
-                         (setf ps (derive-secret ps "path")))
-                (setf commit-secret ps)))))))
-    ;; keys for removed / truncated nodes
+            (let ((ctx (group-context-octets
+                        (copy-group-context-with old-gc
+                                                 :epoch (1+ (group-context-epoch old-gc))
+                                                 :tree-hash (rt-tree-hash tree)
+                                                 :extensions (applied-extensions applied)))))
+              (multiple-value-bind (keys csecret)
+                  (decrypt-update-path tree own fdp path (mls-group-node-sks g) ctx
+                                       (mapcar #'car (applied-joiners applied)))
+                (loop for (p . sk) in keys do (setf (gethash p new-sks) sk))
+                (setf commit-secret csecret)))))))
     (maphash (lambda (k v) (declare (ignore v))
                (unless (and (< k (rt-size tree)) (rt-node tree k)) (remhash k new-sks)))
              new-sks)
-    (let* ((confirmed (confirmed-transcript-hash-next (mls-group-interim-hash g) +wf-public-message+
-                                                      fc (auth-data-signature (public-message-auth pm))))
+    (let* ((confirmed (confirmed-transcript-hash-next (mls-group-interim-hash g) wire-format
+                                                      fc (auth-data-signature auth)))
            (new-gc (copy-group-context-with old-gc
                                             :epoch (1+ (group-context-epoch old-gc))
                                             :tree-hash (rt-tree-hash tree)
@@ -568,9 +616,10 @@ G is not modified."
                                        commit-secret (group-context-octets new-gc)))
            (new (make-mls-group :context new-gc :tree tree :own-leaf own
                                 :sig-sk (mls-group-sig-sk g) :node-sks new-sks)))
-      (%init-epoch new joiner (zero-secret))
+      (%carry-psk-state g new)
+      (%init-epoch new joiner (%psk-secret-for g (applied-psks applied)))
       (let ((tag (mls-mac (epoch-secrets-confirmation-key (mls-group-secrets new)) confirmed)))
-        (unless (ct-octets= tag (auth-data-confirmation-tag (public-message-auth pm)))
+        (unless (ct-octets= tag (auth-data-confirmation-tag auth))
           (mls-fail "bad confirmation tag"))
         (setf (mls-group-confirmation-tag new) tag
               (mls-group-interim-hash new) (interim-transcript-hash-next confirmed tag)))
@@ -579,7 +628,7 @@ G is not modified."
 ;;; ---------------------------------------------------------------------------
 ;;; Joining from a Welcome (§12.4.3.1)
 
-(defun join-from-welcome (welcome bundle &key ratchet-tree-nodes)
+(defun join-from-welcome (welcome bundle &key ratchet-tree-nodes external-psks)
   "WELCOME is a WELCOME struct; BUNDLE the KEY-PACKAGE-BUNDLE it targets.
 Returns (values group group-info)."
   (let* ((kp (key-package-bundle-key-package bundle))
@@ -593,11 +642,15 @@ Returns (values group group-info)."
                                 (decrypt-with-label (key-package-bundle-init-sk bundle) "Welcome"
                                                     (welcome-encrypted-group-info welcome)
                                                     (encrypted-group-secrets-encrypted-group-secrets egs))))
-           (_ (when (group-secrets-psks gs) (mls-fail "PSKs in Welcome are not supported")))
-           (psk (zero-secret))
+           (psk (psk-secret (mapcar (lambda (id)
+                                      (unless (= (pre-shared-key-id-type id) 1)
+                                        (mls-fail "resumption PSK in Welcome is not supported"))
+                                      (cons id (or (cdr (assoc (pre-shared-key-id-psk-id id) external-psks
+                                                               :test #'octets=))
+                                                   (mls-fail "unknown external PSK"))))
+                                    (group-secrets-psks gs))))
            (member (hkdf-extract (group-secrets-joiner-secret gs) psk))
            (welcome-secret (derive-secret member "welcome")))
-      (declare (ignore _))
       (multiple-value-bind (key nonce) (welcome-key-nonce welcome-secret)
         (let* ((gi (tls-deserialize 'group-info
                                     (mls-aead-decrypt key nonce (welcome-encrypted-group-info welcome)
@@ -644,7 +697,8 @@ Returns (values group group-info)."
                         (setf (gethash p sks) sk))
                       (setf ps (derive-secret ps "path"))))))
               (let ((g (make-mls-group :context gc :tree tree :own-leaf own
-                                       :sig-sk (key-package-bundle-sig-sk bundle) :node-sks sks)))
+                                       :sig-sk (key-package-bundle-sig-sk bundle) :node-sks sks
+                                       :external-psks external-psks)))
                 (%init-epoch g (group-secrets-joiner-secret gs) psk)
                 (let ((tag (mls-mac (epoch-secrets-confirmation-key (mls-group-secrets g))
                                     (group-context-confirmed-transcript-hash gc))))
@@ -741,7 +795,8 @@ G's secret tree (consumes a generation)."
                         :data (framed-content-application-data fc)
                         :authenticated-data (framed-content-authenticated-data fc)))
                (2 (%store-proposal g fc auth +wf-private-message+))
-               (3 (mls-fail "commits in PrivateMessage are not used by Marmot")))))))
+               (3 (list :type :commit :sender sender :commit (framed-content-commit fc)
+                        :new-group (process-commit-content g fc auth +wf-private-message+))))))))
       ((= wf +wf-public-message+)
        (let* ((pm (mls-message-body msg))
               (fc (public-message-content pm)))

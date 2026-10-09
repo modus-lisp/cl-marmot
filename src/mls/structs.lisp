@@ -171,6 +171,9 @@
   (kem-output :opaque)
   (ciphertext :opaque))
 
+(defun encode-extension-list (w exts) (w-vector w exts #'encode-extension))
+(defun decode-extension-list (r) (r-vector r #'decode-extension))
+
 ;;; Credential (select on credential_type)
 
 (defstruct credential
