@@ -31,31 +31,40 @@ State: $MARMOT_HOME/account.sexp (default ~/.local/share/cl-marmot/)
 (defun %npub (hex) (cl-marmot::npub-encode (cl-marmot::hex->octets hex)))
 (defun %label (chat) (if (plusp (length (chat-name chat))) (chat-name chat) (%short (chat-id chat))))
 
+(defvar *client* nil "The client the CLI is printing for (for display names).")
+
+(defun %who (hex) (if *client* (display-name *client* hex) (%short (%npub hex))))
+
 (defun %print-message (chat m)
-  (%out "[~A] ~A: ~A~%" (%label chat) (%short (%npub (message-sender m)))
+  (%out "[~A] ~A: ~A~@[ (edited)~]~:[~; ~:*~{~A~^ ~}~]~%" (%label chat) (%who (message-sender m))
         (if (eql (message-kind m) 9)
             (message-content m)
-            (format nil "(kind ~D) ~A" (message-kind m) (message-content m)))))
+            (format nil "(kind ~D) ~A" (message-kind m) (message-content m)))
+        (message-edited-p m)
+        (mapcar #'cdr (message-reactions m))))
 
 (defun %print-event (e)
   (let ((chat (event-chat e)))
     (case (event-type e)
-      (:message (%print-message chat (event-message e)))
+      ((:message :app-event) (%print-message chat (event-message e)))
+      (:edit (%out "[~A] ~A edited a message: ~A~%" (%label chat) (%who (message-sender (event-message e)))
+                   (message-content (event-message e))))
+      (:reaction (%out "[~A] ~A reacted ~A~%" (%label chat) (%who (message-sender (event-message e)))
+                       (message-content (event-message e))))
       (:joined (%out "[~A] joined (epoch ~D)~%" (%label chat) (chat-epoch chat)))
-      (:epoch (%out "[~A] epoch ~D~%" (%label chat) (getf (event-detail e) :epoch)))
-      (:member-added (%out "[~A] + ~A~%" (%label chat) (%npub (event-account e))))
-      (:member-removed (%out "[~A] - ~A~%" (%label chat) (%npub (event-account e))))
-      (:renamed (%out "[~A] renamed to ~S~%" (%label chat) (getf (event-detail e) :name)))
+      (:epoch (%out "[~A] epoch ~D~%" (%label chat) (event-epoch e)))
+      (:member-added (%out "[~A] + ~A~%" (%label chat) (%who (event-account e))))
+      (:member-removed (%out "[~A] - ~A~%" (%label chat) (%who (event-account e))))
+      (:renamed (%out "[~A] renamed to ~S~%" (%label chat) (event-name e)))
       (:removed (%out "[~A] you were removed~%" (%label chat)))
       (:commit-invalidated (%out "[~A] a competing commit won: epoch ~D was rolled back~%" (%label chat)
-                                 (getf (event-detail e) :epoch)))
+                                 (event-epoch e)))
       (:message-invalidated (%out "[~A] withdrawn (its branch lost): message ~A~%" (%label chat)
-                                  (%short (or (getf (event-detail e) :id) ""))))
+                                  (%short (or (event-message-id e) ""))))
       (:pending-superseded (%out "[~A] another member's commit took epoch ~D; ours was dropped~@[ (re-invite ~{~A~^, ~})~]~%"
-                                 (%label chat) (getf (event-detail e) :epoch)
-                                 (mapcar #'%npub (getf (event-detail e) :invitees))))
-      (:rejected (%out "[~A] rejected input: ~A~%" (%label chat) (getf (event-detail e) :reason)))
-      (t (%out "[~A] ~S~%" (%label chat) (event-detail e))))))
+                                 (%label chat) (event-epoch e) (mapcar #'%who (event-invitees e))))
+      (:rejected (%out "[~A] rejected input: ~A~%" (%label chat) (event-reason e)))
+      (t (%out "[~A] ~(~A~)~%" (%label chat) (event-type e))))))
 
 (defun %parse-flags (args)
   "Split ARGS into (values flag-alist positional)."
@@ -75,7 +84,8 @@ State: $MARMOT_HOME/account.sexp (default ~/.local/share/cl-marmot/)
 (defun run-command (client cmd args)
   "Run one CLI command against CLIENT, printing to *STANDARD-OUTPUT*.  Returns
 the exit code."
-  (flet ((chat () (or (and (first args) (find-chat client (first args)))
+  (let ((*client* client))
+   (flet ((chat () (or (and (first args) (find-chat client (first args)))
                       (error 'marmot-error :message (format nil "no chat ~S" (first args))))))
     (cond
       ((string= cmd "whoami") (%out "~A~%~A~%relays: ~{~A~^ ~}~%" (npub client) (pubkey client) (relays client)))
@@ -105,10 +115,10 @@ the exit code."
        (sync client)
        (let ((c (chat)))
          (dolist (m (chat-members c))
-           (%out "~A~:[~; (admin)~]~:[~; (you)~]~%" (%npub m)
+           (%out "~A  ~A~:[~; (admin)~]~:[~; (you)~]~%" (%npub m) (display-name client m)
                  (member m (chat-admins c) :test #'string=) (string= m (pubkey client))))))
       (t (error 'marmot-error :message (format nil "unknown command ~S (try `marmot help`)" cmd))))
-    0))
+    0)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; The socket.  One request per connection: a JSON array of strings (the
@@ -162,6 +172,7 @@ the exit code."
   client)
 
 (defun stop-serving (client)
+  "Stop accepting CLI commands on the account's socket."
   (let ((socket (client-server-socket client)) (thread (client-server-thread client)))
     (when socket
       (ignore-errors (%sock "SOCKET-CLOSE" socket))
@@ -193,12 +204,13 @@ nothing is listening."
 ;;; Entry point
 
 (defun cli-main (args)
+  "The `marmot` command: run ARGS (a list of strings), return the exit code."
   (handler-case (%cli args)
     (error (c) (%out "error: ~A~%" c) 1)))
 
 (defun %hold (client seconds print)
   "Run as the account's owner: background sync + socket, until SECONDS pass (or forever)."
-  (when print (add-handler client #'%print-event))
+  (when print (add-handler client (lambda (e) (let ((*client* client)) (%print-event e)))))
   (start client :serve t)
   (if seconds
       (sleep seconds)

@@ -72,9 +72,17 @@ The public API is the `MARMOT` package (`src/api.lisp`):
 |---|---|
 | accounts | `create-account` `open-account` `close-account` `with-account` `npub` `pubkey` `relays` `publish-key-package` |
 | chats | `chats` `find-chat` `chat-id` `chat-name` `chat-description` `chat-members` `chat-admins` `chat-epoch` `chat-active-p` `chat-leaving-p` `chat-messages` |
-| messages | `message-id` `message-chat-id` `message-sender` `message-kind` `message-content` `message-tags` `message-created-at` `message-epoch` `message-own-p` |
+| messages | `message-id` `message-chat-id` `message-sender` `message-kind` `message-content` `message-tags` `message-created-at` `message-epoch` `message-own-p` `message-edited-p` `message-reply-to` `message-reactions` `message-invalidated-p` |
+| people | `profile` `display-name` |
 | actions | `create-chat` `send` `invite` `remove-members` `rename` `promote` `demote` `leave` `self-update` |
-| events | `sync` `start` `stop` `running-p` `add-handler` `remove-handler`; `event-type` (`:message` `:joined` `:member-added` `:member-removed` `:renamed` `:removed` `:epoch` `:rejected`), `event-chat` `event-message` `event-account` `event-detail` |
+| events | `sync` `start` `stop` `running-p` `add-handler` `remove-handler`; `event-type`, `event-chat`, `event-message`, `event-account`, `event-epoch`, `event-name`, `event-reason`, `event-commit`, `event-message-id`, `event-target-id`, `event-invitees` |
+
+`chat-messages` returns kind 9 chat messages with edits (kind 1009, by the original author) and reactions (kind 7)
+applied; push-notification bookkeeping and group system rows are not messages. Event types are `:message` `:edit`
+`:reaction` `:app-event` `:joined` `:member-added` `:member-removed` `:renamed` `:epoch` `:removed`
+`:pending-superseded` `:commit-invalidated` `:message-invalidated` `:rejected` (see the `event` docstring). When two
+members commit at once, every member converges on the same branch (`protocol-core/convergence.md`); if a change you
+were shown loses, `:commit-invalidated` and `:message-invalidated` say so.
 
 An open client owns its account: a lock file keeps other processes out (two writers would reuse MLS message keys),
 and a recursive lock makes the API safe to call from the application's threads while the background thread syncs.
@@ -94,6 +102,14 @@ Whatever process holds the account — `marmot daemon`, `marmot watch` (the same
 application that called `marmot:start` — listens on `$MARMOT_HOME/marmot.sock` (owner-only). Other `marmot`
 commands find it and run inside that process instead of failing on the lock. `bin/marmot help` lists every command.
 The account file holds every secret the account has and is written owner-only.
+
+## Security
+
+cl-marmot is new and **has not been audited**. Its MLS, Marmot and Nostr code is checked against the published test
+vectors and against mdk; that is evidence of interoperability, not of security. Secret-key operations use natrium
+and secp256k1-fast, which are written for constant time; seal's AES-GCM (used for MLS message encryption) is
+table-driven and is not. The account file and message log hold every key and message the account has, are written
+owner-only, and are not encrypted at rest.
 
 ## Layout
 

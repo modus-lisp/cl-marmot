@@ -21,6 +21,7 @@
   (unsaved-messages '())               ; (group-id-hex . message-plist), newest first, for the log
   (last-saved nil)                     ; the account text last written (to skip unchanged saves)
   (last-kp-check 0)                    ; when KeyPackage upkeep last ran (in-memory)
+  (profiles (make-hash-table :test #'equal)) ; pubkey hex -> (fetched-at . plist)
   (checkpoint nil)                     ; (lambda ()) that saves the account; called before publishing
   (on-event nil))                      ; (lambda (account group result)) for UIs
 
@@ -147,6 +148,27 @@ confirmed, older KeyPackages in that slot are dropped with their keys."
           (when new
             (setf (account-key-packages acct) (set-difference (account-key-packages acct) old))
             (%checkpoint acct)))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Profiles (NIP-01 kind 0)
+
+(defun account-profile (acct pubkey-hex &key (max-age 86400))
+  "The newest kind 0 profile of PUBKEY-HEX as a plist, cached for MAX-AGE seconds."
+  (let ((cached (gethash pubkey-hex (account-profiles acct))))
+    (if (and cached (< (- (unix-time) (car cached)) max-age))
+        (cdr cached)
+        (let* ((ev (%latest (remove-if-not (lambda (e) (string= (ev:event-pubkey e) pubkey-hex))
+                                           (ignore-errors
+                                            (pool-query acct (%lookup-relays acct)
+                                                        (list (flt:make-filter :kinds '(0) :authors (list pubkey-hex))))))))
+               (json (and ev (ignore-errors (parse-json (ev:event-content ev)))))
+               (plist (and (jobj-p json)
+                           (loop for (key . field) in '((:name . "name") (:display-name . "display_name")
+                                                        (:about . "about") (:picture . "picture") (:nip05 . "nip05"))
+                                 for v = (jget json field)
+                                 when (stringp v) append (list key v)))))
+          (setf (gethash pubkey-hex (account-profiles acct)) (cons (unix-time) plist))
+          plist))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Directory lookups
