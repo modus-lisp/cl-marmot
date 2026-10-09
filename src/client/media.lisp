@@ -20,6 +20,12 @@
 (defparameter *allow-loopback-media* (equal (getenv "MARMOT_ALLOW_LOOPBACK_MEDIA") "1")
   "Contact Blossom servers on loopback addresses (development and tests).")
 
+(defun %blossom-timeout ()
+  "cl-nostr bounds a Blossom request with a deadline THREAD; the :DIRECT relay
+transport is for Lisps whose threads cannot hand results back, so it runs the
+request inline (NIL) there."
+  (if (%direct-p) nil blossom:*blossom-timeout*))
+
 (defun %contactable-url-p (url)
   (multiple-value-bind (scheme host) (%parse-http-url url)
     (and scheme (or *allow-loopback-media* (not (%loopback-host-p host))))))
@@ -42,7 +48,8 @@ locator URL (the server's descriptor url, else server_root/hash)."
           (push (format nil "~A: not contacted (loopback)" server) failures)
           (handler-case
               (multiple-value-bind (hash descriptor url)
-                  (blossom:blossom-upload server ciphertext (%keypair (account-sk acct)))
+                  (blossom:blossom-upload server ciphertext (%keypair (account-sk acct))
+                                          :timeout (%blossom-timeout))
                 (declare (ignore hash))
                 (let ((given (and (hash-table-p descriptor) (gethash "url" descriptor))))
                   (return-from %upload-blob
@@ -106,7 +113,8 @@ plist of MG.  Returns (values plaintext attachment)."
       (dolist (url (%blob-urls mg att))
         (if (not (%contactable-url-p url))
             (push (format nil "~A: not contacted (loopback)" url) tried)
-            (let ((f (blossom:blossom-fetch url :expect (string-downcase (getf att :ciphertext-sha256)))))
+            (let ((f (blossom:blossom-fetch url :expect (string-downcase (getf att :ciphertext-sha256))
+                                                :timeout (%blossom-timeout))))
               (if (blossom:fetch-ok-p f)
                   (return-from fetch-media
                     (values (decrypt-media secret att (coerce-octets (blossom:fetch-bytes f))) att))

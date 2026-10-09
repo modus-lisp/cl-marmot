@@ -20,10 +20,11 @@ relay="ws://127.0.0.1:$port"
 export WN_HOME="$work/wn" WN_SECRET_STORE=file WN_ALLOW_LOOPBACK_RELAYS=1
 unset WN_SOCKET
 export MARMOT_HOME="$work/marmot"
-marmot="$here/bin/marmot"
+marmot="${MARMOT_CMD:-$here/bin/marmot}"
 pass=0; fail=0
 
 cleanup() {
+  [ -n "${daemon_pid:-}" ] && kill "$daemon_pid" 2>/dev/null
   wn daemon stop >/dev/null 2>&1
   [ -n "${relay_pid:-}" ] && kill "$relay_pid" 2>/dev/null
   [ "${KEEP:-0}" = 1 ] && echo "kept $work" || rm -rf "$work"
@@ -47,8 +48,18 @@ wn daemon start --discovery-relays "$relay" --default-account-relays "$relay" >/
 alice=$(wn --json create-identity | sed -n 's/.*"npub":"\(npub1[0-9a-z]*\)".*/\1/p' | head -1)
 bob=$(wn --json create-identity | sed -n 's/.*"npub":"\(npub1[0-9a-z]*\)".*/\1/p' | head -1)
 carol=$("$marmot" init --relay "$relay" --name carol)
+# MARMOT_DAEMON: a command that holds carol's account (e.g. `marmot daemon`
+# under another Lisp).  Every later `marmot` command forwards to it over
+# $MARMOT_HOME/marmot.sock, so the whole run exercises that process.
+if [ -n "${MARMOT_DAEMON:-}" ]; then
+  $MARMOT_DAEMON > "$work/daemon.log" 2>&1 &
+  daemon_pid=$!
+  i=0; while [ ! -S "$MARMOT_HOME/marmot.sock" ] && [ "$i" -lt 900 ]; do sleep 1; i=$((i + 1)); done
+  [ -S "$MARMOT_HOME/marmot.sock" ] || { echo "daemon never listened"; tail -20 "$work/daemon.log"; exit 2; }
+  echo "carol is held by: $MARMOT_DAEMON (listening after ${i}s)"
+fi
 echo "relay $relay  alice(wn) $alice  bob(wn) $bob  carol(cl-marmot) $carol"
-settle() { sleep "${1:-3}"; }
+settle() { sleep $(( ${1:-3} * ${SETTLE_SCALE:-1} )); }
 
 # --- A: wn creates the group, cl-marmot joins ------------------------------
 out=$(wn --json --account "$alice" groups create "from wn" "$carol" 2>&1)

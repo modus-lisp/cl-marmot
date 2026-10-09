@@ -1,0 +1,11 @@
+#!/bin/bash
+# bin/marmot-modus ARGS... -- the `marmot` command run by Modus instead of SBCL.
+#   MODUS=/path/to/modus bin/marmot-modus whoami
+# Each command is its own Modus process (about a minute to load); see
+# modus/marmot-cli.lisp for what is different there.
+set -o pipefail
+here="$(cd "$(dirname "$0")/.." && pwd)"
+: "${MODUS:?set MODUS to the modus binary}"
+MARMOT_ARGV=$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "$@") \
+  "$MODUS" --script "$here/modus/marmot-cli.lisp" 2>&1 \
+  | grep -a -v -E '^  (GC trampoline|Handler-stack|WARN: implicit)|^$'

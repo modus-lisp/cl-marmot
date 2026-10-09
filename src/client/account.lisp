@@ -45,6 +45,26 @@ bytes can be on the wire (publish-lifecycle.md 'Restart')."
 
 (defparameter *relay-timeout* 8 "Seconds to wait for relay ACKs / EOSE.")
 
+;;; Two transports.  :POOL is cl-nostr's relay pool: a reader thread per relay
+;;; and deadline threads around every request.  :DIRECT is synchronous, on the
+;;; calling thread only: one blocking websocket per relay URL, a request written
+;;; and its answer read before the call returns.  :DIRECT exists for Lisps whose
+;;; threads cannot share mutable state -- Modus gives each native thread its own
+;;; heap and refuses a store of one thread's object into another's data, which
+;;; is what the pool's reader threads do with every event -- and is the default
+;;; there.  Its cost: no deadlines (seal's websocket client has none), so a
+;;; relay that accepts a connection and never answers blocks the call.
+
+(defparameter *relay-transport*
+  (let ((env (getenv "MARMOT_RELAY_TRANSPORT")))
+    (cond ((equal env "direct") :direct)
+          ((equal env "pool") :pool)
+          ((and (member :modus *features*) (not (member :sbcl *features*))) :direct)
+          (t :pool)))
+  ":POOL (cl-nostr's threaded relay pool) or :DIRECT (synchronous, one thread).")
+
+(defun %direct-p () (eq *relay-transport* :direct))
+
 (defun %pool-for (acct urls)
   (let* ((urls (sort (remove-duplicates (copy-list urls) :test #'string=) #'string<))
          (key (format nil "~{~A~^ ~}" urls)))
@@ -52,19 +72,87 @@ bytes can be on the wire (publish-lifecycle.md 'Restart')."
         (setf (gethash key (account-pools acct)) (pool:make-pool urls :timeout *relay-timeout*)))))
 
 (defun close-account-pools (acct)
-  (loop for p being the hash-values of (account-pools acct) do (ignore-errors (pool:close-pool p)))
+  (loop for p being the hash-values of (account-pools acct)
+        do (ignore-errors (if (%direct-p) (seal.websocket:close-socket p) (pool:close-pool p))))
   (clrhash (account-pools acct)))
 
+;;; :DIRECT -- the NIP-01 exchanges, on this thread
+
+(defun %direct-ws (acct url)
+  "The open websocket to URL (connecting on first use), or NIL if unreachable."
+  (or (gethash url (account-pools acct))
+      (let ((ws (ignore-errors (seal.websocket:connect url))))
+        (when ws (setf (gethash url (account-pools acct)) ws)))))
+
+(defun %direct-drop (acct url)
+  (let ((ws (gethash url (account-pools acct))))
+    (when ws (ignore-errors (seal.websocket:close-socket ws)) (remhash url (account-pools acct)))))
+
+(defun %direct-exchange (acct url request done-p)
+  "Send REQUEST (a JSON string) to URL and read relay messages (parsed JSON
+arrays) until DONE-P returns true for one.  Returns that message, or signals."
+  (let ((ws (or (%direct-ws acct url) (error "cannot connect to ~A" url))))
+    (handler-case
+        (progn
+          (seal.websocket:send-text ws request)
+          (loop for text = (seal.websocket:receive-text ws)
+                do (unless text (error "~A closed the connection" url))
+                   (let ((msg (ignore-errors (parse-json text))))
+                     (when (and (vectorp msg) (not (stringp msg)) (funcall done-p msg))
+                       (return msg)))))
+      (error (c) (%direct-drop acct url) (error c)))))
+
+(defun %direct-publish (acct urls ev)
+  (loop for url in (remove-duplicates urls :test #'string=)
+        collect (handler-case
+                    (let ((ok (%direct-exchange
+                               acct url (to-json (vector "EVENT" (event->jobj ev)))
+                               (lambda (m) (and (equal (aref m 0) "OK") (> (length m) 2)
+                                                (equal (aref m 1) (ev:event-id ev)))))))
+                      (list url (eq (aref ok 2) :true) (if (> (length ok) 3) (aref ok 3) "")))
+                  (error (c) (list url nil (princ-to-string c))))))
+
+(defvar *direct-sub-counter* 0)
+
+(defun %direct-query (acct urls filters)
+  (let ((seen (make-hash-table :test #'equal)) (out '()))
+    (dolist (url (remove-duplicates urls :test #'string=))
+      (let ((sub (format nil "m~D" (incf *direct-sub-counter*))) (events '()))
+        (handler-case
+            (progn
+              (%direct-exchange
+               acct url
+               (format nil "[\"REQ\",~A~{,~A~}]" (to-json sub) (mapcar #'flt:filter->json filters))
+               (lambda (m)
+                 (cond ((and (equal (aref m 0) "EVENT") (> (length m) 2) (equal (aref m 1) sub))
+                        (let ((e (ignore-errors (jobj->event (aref m 2) :require-sig t))))
+                          (when e (push e events)))
+                        nil)
+                       (t (and (member (aref m 0) '("EOSE" "CLOSED") :test #'equal)
+                               (> (length m) 1) (equal (aref m 1) sub))))))
+              (ignore-errors (seal.websocket:send-text (%direct-ws acct url)
+                                                      (to-json (vector "CLOSE" sub)))))
+          (error () nil))
+        (dolist (e events)
+          (unless (gethash (ev:event-id e) seen)
+            (setf (gethash (ev:event-id e) seen) t)
+            (push e out)))))
+    (nreverse out)))
+
 (defun pool-publish* (acct urls ev)
-  (mapcar (lambda (ack) (list (pool:ack-url ack) (pool:ack-accepted-p ack) (pool:ack-message ack)))
-          (pool:pool-publish-sync (%pool-for acct urls) ev :timeout *relay-timeout*)))
+  (if (%direct-p)
+      (%direct-publish acct urls ev)
+      (mapcar (lambda (ack) (list (pool:ack-url ack) (pool:ack-accepted-p ack) (pool:ack-message ack)))
+              (pool:pool-publish-sync (%pool-for acct urls) ev :timeout *relay-timeout*))))
 
 (defun publish-accepted-p (results) (some #'second results))
 
 (defun pool-query (acct urls filters)
   "Stored events matching FILTERS on URLS, each one verified (id + signature)."
   (remove-if-not #'verify-event
-                 (pool:fetch-events (%pool-for acct urls) filters :timeout *relay-timeout*)))
+                 (if (%direct-p)
+                     (%direct-query acct urls filters)
+                     (pool:fetch-events (%pool-for acct urls) filters :timeout *relay-timeout*))))
 
 (defun %publish (acct urls ev &key (require t))
   (let ((results (pool-publish* acct urls ev)))

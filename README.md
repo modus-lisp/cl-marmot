@@ -173,4 +173,10 @@ test/         unit tests, MLS/NIP-44 vectors, wn interop harnesses (protocol, me
   notifications, NIP-46 remote signers, disbanding, and agent text streams beyond the receive-role fallback.
 - **Large groups**: we only commit other members' SelfRemove proposals in chats of 8 or fewer
   (`*auto-commit-max-members*`); in larger chats an admin's own client is expected to do it, so we do not race it.
-- **Modus**: cl-marmot loads on Modus, but runs far slower there than on SBCL; SBCL is the supported platform.
+- **Modus**: `bin/marmot-modus` (with `MODUS=/path/to/modus`) runs each command in a Modus process, and the wn
+  interop suite passes 22 of 22 that way (`MARMOT_CMD=bin/marmot-modus test/interop/run-wn-interop.sh`) on a
+  Modus with the comparison/COERCE/PARSE-INTEGER/TYPEP fixes from its `cmp-type-error` branch.  It is
+  single-threaded there: Modus gives each native thread its own heap, so cl-nostr's threaded relay pool and
+  `marmot daemon` cannot run; relays are reached with the synchronous `:direct` transport instead.  Each command
+  loads cl-marmot first (about a minute), and Lisp-speed crypto makes commits take tens of seconds.  SBCL
+  remains the supported platform.
