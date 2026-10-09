@@ -2,7 +2,7 @@
 
 (asdf:defsystem #:cl-marmot
   :description "A Marmot protocol client: MLS (RFC 9420) group messaging over Nostr, in portable Common Lisp."
-  :version "0.9.0"
+  :version "1.0.0"
   :author "ynniv"
   :license "MIT"
   :depends-on (#:natrium #:secp256k1-fast #:seal #:cl-nostr #:bordeaux-threads)

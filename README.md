@@ -43,12 +43,31 @@ McGrew–Viega GCM, all 19 BIP-340 rows), and the NIP-44 v2 vectors run against 
 
 ```
 test/fetch-vectors.sh          # the MLS WG and NIP-44 vectors, pinned and checksummed
-./run-tests.sh                 # 52 tests, 10,947 checks
+./run-tests.sh                 # 59 tests, 10,984 checks
 WN_BIN=/path/to/wn-dir test/interop/run-wn-interop.sh
 ```
 
 The external vectors are fetched rather than vendored (their repositories declare no licence); a missing vector
 file fails the suite rather than skipping it.
+
+## Installing
+
+cl-marmot runs on SBCL. It needs five [modus-lisp](https://github.com/modus-lisp) libraries, checked out next to it
+(or anywhere, with `MODUS_LISP` pointing at their parent directory), and [Quicklisp](https://www.quicklisp.org/) for
+`bordeaux-threads` and `cl-base64`:
+
+```sh
+mkdir modus-lisp && cd modus-lisp
+for repo in cl-marmot natrium secp256k1-fast seal cl-nostr json-simple; do
+  git clone https://github.com/modus-lisp/$repo.git
+done
+cd cl-marmot
+test/fetch-vectors.sh && ./run-tests.sh      # optional: the test suite
+bin/marmot help
+```
+
+From Lisp: `(load "load-deps.lisp")` (it loads Quicklisp and registers the siblings), then
+`(ql:quickload :cl-marmot)`.
 
 ## Lisp API
 

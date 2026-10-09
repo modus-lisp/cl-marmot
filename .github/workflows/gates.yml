@@ -1,0 +1,45 @@
+name: gates
+on: [push, pull_request]
+
+# Portable Common Lisp: one platform.  The interop harness against mdk's `wn`
+# (test/interop/run-wn-interop.sh) needs a Rust build of wn and is run by hand.
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: cl-marmot
+
+      # cl-marmot is one repo in a workspace of them; load-deps.lisp looks for the
+      # siblings beside it.  This is the TRANSITIVE set: a stale list fails as
+      # "Component X not found".
+      - name: Sibling checkouts
+        run: |
+          for repo in natrium secp256k1-fast seal cl-nostr json-simple; do
+            git clone --depth 1 -q https://github.com/modus-lisp/$repo.git "$repo"
+          done
+
+      - name: Install SBCL
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq sbcl
+
+      - name: Quicklisp dependencies
+        run: |
+          for attempt in 1 2 3; do
+            rm -rf ~/quicklisp
+            curl -sSLo /tmp/quicklisp.lisp https://beta.quicklisp.org/quicklisp.lisp || { sleep 5; continue; }
+            sbcl --non-interactive --load /tmp/quicklisp.lisp \
+                 --eval '(quicklisp-quickstart:install :path "~/quicklisp/")' && break
+            echo "quicklisp install attempt $attempt failed; retrying"
+            sleep 10
+          done
+          sbcl --non-interactive --load ~/quicklisp/setup.lisp \
+               --eval '(ql:quickload (list :bordeaux-threads :cl-base64))'
+
+      - name: Test vectors
+        working-directory: cl-marmot
+        run: test/fetch-vectors.sh
+
+      - name: Test suite
+        working-directory: cl-marmot
+        run: ./run-tests.sh
