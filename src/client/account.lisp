@@ -18,6 +18,8 @@
   (seen-group-events (make-hash-table :test #'equal))
   (last-sync 0)
   (outbox '())                         ; Welcome deliveries still owed (plists), see QUEUE-WELCOMES
+  (unsaved-messages '())               ; (group-id-hex . message-plist), newest first, for the log
+  (last-saved nil)                     ; the account text last written (to skip unchanged saves)
   (checkpoint nil)                     ; (lambda ()) that saves the account; called before publishing
   (on-event nil))                      ; (lambda (account group result)) for UIs
 
@@ -160,7 +162,7 @@ setup (tests, development) never touches public infrastructure.")
   "Returns the new MARMOT-GROUP if WRAP was a Welcome we could join."
   (when (gethash (ev:event-id wrap) (account-seen-wraps acct))
     (return-from process-gift-wrap nil))
-  (setf (gethash (ev:event-id wrap) (account-seen-wraps acct)) t)
+  (setf (gethash (ev:event-id wrap) (account-seen-wraps acct)) (ev:event-created-at wrap))
   (let ((rumor (handler-case (gift-unwrap wrap (account-sk acct))
                  (error (c) (warn "gift wrap ~A: ~A" (ev:event-id wrap) c) nil))))
     (when (and rumor (= (ev:event-kind rumor) 444))
@@ -213,6 +215,38 @@ setup (tests, development) never touches public infrastructure.")
   (loop for g being the hash-values of (account-groups acct)
         when (string= h (octets->hex (mg-nostr-group-id g))) return g))
 
+(defun %record-message (acct mg plist)
+  "Queue a delivered or sent message for the account's message log."
+  (push (cons (mg-id-hex mg) plist) (account-unsaved-messages acct)))
+
+(defparameter *refetch-overlap* 600
+  "Seconds of overlap when resuming a chat's kind 445 fetch from its cursor:
+relays and senders do not agree on clocks, and dedup absorbs the repeats.")
+
+(defun %retry-deferred (acct mg)
+  "Re-process deferred events; those that decrypt now leave the queue."
+  (let ((waiting (reverse (marmot-group-deferred mg))) (results '()))
+    (setf (marmot-group-deferred mg) '())
+    (dolist (d waiting)
+      (let ((r (process-group-event acct (cdr d))))
+        (unless (equal r '((:type :undecryptable)))
+          (setf results (append results r)))))
+    results))
+
+(defun prune-account (acct)
+  "Bound the dedup tables: an event older than every chat's fetch window can
+no longer be refetched; gift wraps are fetched from up to three days back."
+  (let* ((now (unix-time))
+         (cursors (loop for mg being the hash-values of (account-groups acct) collect (marmot-group-cursor mg)))
+         (group-floor (- (if cursors (reduce #'min cursors) now) *refetch-overlap* 86400))
+         (wrap-floor (- now (* 8 24 3600))))
+    (loop for k being the hash-keys of (account-seen-group-events acct) using (hash-value at)
+          when (or (not (integerp at)) (< at group-floor)) do (remhash k (account-seen-group-events acct)))
+    (loop for k being the hash-keys of (account-seen-wraps acct) using (hash-value at)
+          when (or (not (integerp at)) (< at wrap-floor)) do (remhash k (account-seen-wraps acct)))
+    (loop for mg being the hash-values of (account-groups acct) do (prune-marmot-group mg))
+    acct))
+
 (defun process-group-event (acct ev)
   (when (gethash (ev:event-id ev) (account-seen-group-events acct))
     (return-from process-group-event nil))
@@ -221,12 +255,19 @@ setup (tests, development) never touches public infrastructure.")
     (when mg
       (let ((results (handler-case (receive-group-event mg ev)
                        (marmot-error (c) (list (list :type :rejected :reason (marmot-error-message c)))))))
-        ;; undecryptable input may become readable after a later commit: keep it eligible
-        (unless (equal results '((:type :undecryptable)))
-          (setf (gethash (ev:event-id ev) (account-seen-group-events acct)) t))
+        ;; undecryptable input may become readable after a later commit: it waits
+        ;; in the chat's deferred queue, retried each sync (transports/nostr.md)
+        (if (equal results '((:type :undecryptable)))
+            (unless (find (ev:event-id ev) (marmot-group-deferred mg)
+                          :key (lambda (d) (ev:event-id (cdr d))) :test #'string=)
+              (push (cons (ev:event-created-at ev) ev) (marmot-group-deferred mg))
+              (when (> (length (marmot-group-deferred mg)) 256)
+                (setf (marmot-group-deferred mg) (subseq (marmot-group-deferred mg) 0 256))))
+            (setf (gethash (ev:event-id ev) (account-seen-group-events acct)) (ev:event-created-at ev)))
         (dolist (r results)
-          (when (eq (getf r :type) :own-commit-merged)
-            (queue-welcomes acct mg (getf r :staged))))
+          (case (getf r :type)
+            (:own-commit-merged (queue-welcomes acct mg (getf r :staged)))
+            (:message (%record-message acct mg r))))
         (when (account-on-event acct)
           (dolist (r results) (funcall (account-on-event acct) acct mg r)))
         results))))
@@ -244,21 +285,33 @@ results produced."
                                                      :since since))))
       (let ((mg (process-gift-wrap acct wrap)))
         (when mg (push (list :type :joined :group (mg-id-hex mg)) results))))
-    ;; group traffic, repeated while it makes progress (a commit can unlock queued messages)
+    ;; group traffic: what is new since each chat's cursor, oldest first
+    (loop for mg being the hash-values of (account-groups acct)
+          when (mls-group-active (marmot-group-mls mg))
+            do (let* ((gid (octets->hex (mg-nostr-group-id mg)))
+                      (events (sort (pool-query acct (mg-relays mg)
+                                                (list (flt:make-filter
+                                                       :kinds '(445) :tags (list (cons "h" (list gid)))
+                                                       :since (max 0 (- (marmot-group-cursor mg) *refetch-overlap*)))))
+                                    #'< :key #'ev:event-created-at)))
+                 (dolist (ev events)
+                   (let ((r (process-group-event acct ev)))
+                     (when r (setf results (append results (remove :undecryptable r :key (lambda (x) (getf x :type))))))))
+                 (when events
+                   (setf (marmot-group-cursor mg)
+                         (min (unix-time) (max (marmot-group-cursor mg)
+                                               (reduce #'max events :key #'ev:event-created-at)))))))
+    ;; a commit can make deferred events decryptable: retry while that makes progress
     (loop repeat 8
-          do (let ((progress nil))
+          do (let ((before (loop for mg being the hash-values of (account-groups acct)
+                                 sum (length (marmot-group-deferred mg)))))
                (loop for mg being the hash-values of (account-groups acct)
-                     for gid = (octets->hex (mg-nostr-group-id mg))
-                     do (let ((events (sort (pool-query acct (mg-relays mg)
-                                                        (list (flt:make-filter :kinds '(445) :tags (list (cons "h" (list gid))))))
-                                            #'< :key #'ev:event-created-at)))
-                          (dolist (ev events)
-                            (let ((r (process-group-event acct ev)))
-                              (when (and r (notany (lambda (x) (eq (getf x :type) :undecryptable)) r))
-                                (setf progress t)
-                                (setf results (append results r)))))))
-               (unless progress (return))))
+                     do (setf results (append results (%retry-deferred acct mg))))
+               (when (= before (loop for mg being the hash-values of (account-groups acct)
+                                     sum (length (marmot-group-deferred mg))))
+                 (return))))
     (commit-pending-self-removes acct)
+    (prune-account acct)
     results))
 
 ;;; ---------------------------------------------------------------------------
@@ -330,7 +383,7 @@ results; on an acknowledgement the commit is merged and its Welcomes queued."
   (let* ((staged (marmot-group-pending mg))
          (ev (seal-group-message (marmot-group-mls mg) (staged-commit-message staged)))
          (results (%publish acct (mg-relays mg) ev :require nil)))
-    (setf (gethash (ev:event-id ev) (account-seen-group-events acct)) t)
+    (setf (gethash (ev:event-id ev) (account-seen-group-events acct)) (ev:event-created-at ev))
     (when (publish-accepted-p results)
       (merge-pending mg)
       (%checkpoint acct)
@@ -391,7 +444,8 @@ echoed back, or superseded by another member's commit."
 
 (defun send-message (acct mg text &key (kind 9) (tags '()))
   (let ((ev (send-app-message mg (account-pubkey acct) kind text :tags tags)))
-    (setf (gethash (ev:event-id ev) (account-seen-group-events acct)) t)
+    (%record-message acct mg (first (marmot-group-messages mg)))
+    (setf (gethash (ev:event-id ev) (account-seen-group-events acct)) (ev:event-created-at ev))
     (%publish acct (mg-relays mg) ev)))
 
 ;;; ---------------------------------------------------------------------------
@@ -423,7 +477,7 @@ admin), then publishes a SelfRemove proposal for a remaining member to commit."
         (unless others (marmot-fail "you are the only admin: promote someone first"))
         (set-admins acct mg others)))
     (let ((ev (self-remove-message mg)))
-      (setf (gethash (ev:event-id ev) (account-seen-group-events acct)) t)
+      (setf (gethash (ev:event-id ev) (account-seen-group-events acct)) (ev:event-created-at ev))
       (%publish acct (mg-relays mg) ev)
       (setf (marmot-group-leaving mg) t))))
 

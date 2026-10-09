@@ -18,7 +18,9 @@
 (defstruct marmot-group
   mls                     ; canonical MLS-GROUP
   (retained '())          ; prior MLS-GROUPs, newest first
-  (seen (make-hash-table :test #'equal))   ; message-id hex -> T
+  (seen (make-hash-table :test #'equal))   ; MLS message-id hex -> epoch it was seen in
+  (cursor 0)              ; created_at high-water mark of kind 445 events fetched
+  (deferred '())          ; kind 445 events not yet decryptable: list of (created-at . event)
   pending                 ; STAGED-COMMIT awaiting publication
   (messages '())          ; delivered app events, newest first (plist per message)
   (log '())               ; state notifications, newest first
@@ -237,7 +239,7 @@ candidate parent MLS."
     (unless bytes (return-from receive-group-event (list (list :type :undecryptable))))
     (let ((mid (octets->hex (sha256 bytes))))
       (when (gethash mid (marmot-group-seen mg)) (return-from receive-group-event (list (list :type :duplicate))))
-      (setf (gethash mid (marmot-group-seen mg)) t)
+      (setf (gethash mid (marmot-group-seen mg)) (mg-epoch mg))
       (let ((msg (tls-deserialize 'mls-message bytes)))
         (cond
           ;; our own pending commit coming back
@@ -389,7 +391,7 @@ the STAGED-COMMIT.  Marmot authorization is checked against the current state."
   "Publication succeeded: the staged commit becomes canonical."
   (let ((staged (marmot-group-pending mg)))
     (unless staged (marmot-fail "nothing pending"))
-    (setf (gethash (octets->hex (sha256 (staged-commit-message staged))) (marmot-group-seen mg)) t)
+    (setf (gethash (octets->hex (sha256 (staged-commit-message staged))) (marmot-group-seen mg)) (mg-epoch mg))
     (setf (marmot-group-pending mg) nil)
     (%apply-new-epoch mg (staged-commit-new-group staged) :committer (mls-group-own-leaf (marmot-group-mls mg)))))
 
@@ -435,7 +437,7 @@ leaving leaf: the one with the lowest proposal digest."
       (marmot-fail "an admin must leave the admin list before leaving"))
     (multiple-value-bind (bytes ref) (create-proposal-message mls (make-proposal :type +prop-self-remove+))
       (declare (ignore ref))
-      (setf (gethash (octets->hex (sha256 bytes)) (marmot-group-seen mg)) t)
+      (setf (gethash (octets->hex (sha256 bytes)) (marmot-group-seen mg)) (mg-epoch mg))
       (seal-group-message mls bytes))))
 
 (defun send-app-message (mg account-pubkey kind content &key (tags '()))
@@ -449,9 +451,20 @@ leaving leaf: the one with the lowest proposal digest."
          (expiry (and (plusp secs)
                       (let ((e (+ (ev:event-created-at app) secs)))
                         (and (< e (expt 2 64)) e)))))
-    (setf (gethash (octets->hex (sha256 bytes)) (marmot-group-seen mg)) t)
+    (setf (gethash (octets->hex (sha256 bytes)) (marmot-group-seen mg)) (mg-epoch mg))
     (push (list :type :message :epoch (mls-group-epoch mls) :sender (ev:event-pubkey app)
                 :kind kind :content content :tags tags :id (ev:event-id app)
                 :created-at (ev:event-created-at app) :own t)
           (marmot-group-messages mg))
     (seal-group-message mls bytes :expiration expiry)))
+
+(defun prune-marmot-group (mg)
+  "Forget dedup ids from epochs too old to decrypt anyway, and give up on
+deferred events older than a week."
+  (let ((floor (- (mg-epoch mg) *retained-epochs* 2))
+        (seen (marmot-group-seen mg)))
+    (loop for k being the hash-keys of seen using (hash-value e)
+          when (and (integerp e) (< e floor)) do (remhash k seen))
+    (setf (marmot-group-deferred mg)
+          (remove-if (lambda (d) (< (car d) (- (unix-time) (* 7 24 3600)))) (marmot-group-deferred mg)))
+    mg))

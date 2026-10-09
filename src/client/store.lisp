@@ -106,21 +106,30 @@
   (list :mls (mls-group->sexp (marmot-group-mls mg))
         :pending (%staged->sexp (marmot-group-pending mg))
         :retained (mapcar #'mls-group->sexp (marmot-group-retained mg))
-        :seen (loop for k being the hash-keys of (marmot-group-seen mg) collect k)
-        :messages (mapcar #'%message->sexp (marmot-group-messages mg))
+        :seen (loop for k being the hash-keys of (marmot-group-seen mg) using (hash-value e) collect (list k e))
+        :cursor (marmot-group-cursor mg)
+        :deferred (mapcar (lambda (d) (event->json (cdr d))) (marmot-group-deferred mg))
         :leaving (marmot-group-leaving mg)
         :log (mapcar (lambda (n) (loop for (k v) on n by #'cddr
                                        append (list k (if (typep v '(vector (unsigned-byte 8))) (%h v) v))))
                      (marmot-group-log mg))))
 
 (defun sexp->marmot-group (s)
+  "MESSAGES in S is the pre-log format; LOAD-ACCOUNT migrates it to the log."
   (let ((mg (make-marmot-group :mls (sexp->mls-group (getf s :mls))
                                :retained (mapcar #'sexp->mls-group (getf s :retained))
                                :messages (getf s :messages)
                                :log (getf s :log)
                                :leaving (getf s :leaving)
+                               :cursor (or (getf s :cursor) 0)
+                               :deferred (loop for j in (getf s :deferred)
+                                               for e = (ignore-errors (json->event j :require-sig t))
+                                               when e collect (cons (ev:event-created-at e) e))
                                :pending (%sexp->staged (getf s :pending)))))
-    (dolist (k (getf s :seen)) (setf (gethash k (marmot-group-seen mg)) t))
+    (dolist (k (getf s :seen))
+      (if (consp k)
+          (setf (gethash (first k) (marmot-group-seen mg)) (second k))
+          (setf (gethash k (marmot-group-seen mg)) (mg-epoch mg))))   ; pre-epoch format
     mg))
 
 ;;; Account
@@ -138,8 +147,9 @@
                                         :event-id (getf e :event-id) :ref (getf e :ref) :d (%h (getf e :d)))))
                               (account-key-packages acct))
         :groups (loop for mg being the hash-values of (account-groups acct) collect (marmot-group->sexp mg))
-        :seen-wraps (loop for k being the hash-keys of (account-seen-wraps acct) collect k)
-        :seen-group-events (loop for k being the hash-keys of (account-seen-group-events acct) collect k)
+        :seen-wraps (loop for k being the hash-keys of (account-seen-wraps acct) using (hash-value v) collect (list k v))
+        :seen-group-events (loop for k being the hash-keys of (account-seen-group-events acct) using (hash-value v)
+                                 collect (list k v))
         :last-sync (account-last-sync acct)
         :outbox (account-outbox acct)))
 
@@ -157,8 +167,14 @@
     (dolist (gs (getf s :groups))
       (let ((mg (sexp->marmot-group gs)))
         (setf (gethash (mg-id-hex mg) (account-groups acct)) mg)))
-    (dolist (k (getf s :seen-wraps)) (setf (gethash k (account-seen-wraps acct)) t))
-    (dolist (k (getf s :seen-group-events)) (setf (gethash k (account-seen-group-events acct)) t))
+    (flet ((restore (table entries)
+             ;; pre-timestamp files stored bare ids: date them now, so they age out normally
+             (dolist (k entries)
+               (if (consp k)
+                   (setf (gethash (first k) table) (second k))
+                   (setf (gethash k table) (unix-time))))))
+      (restore (account-seen-wraps acct) (getf s :seen-wraps))
+      (restore (account-seen-group-events acct) (getf s :seen-group-events)))
     (setf (account-last-sync acct) (or (getf s :last-sync) 0)
           (account-outbox acct) (getf s :outbox))
     acct))
@@ -172,29 +188,68 @@ chmod: SB-POSIX on SBCL and in Modus's compatibility surface)."
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (unless (find-package "SB-POSIX") (ignore-errors (require "SB-POSIX"))))
 
+(defun %messages-path (account-path)
+  (concatenate 'string (namestring (make-pathname :name nil :type nil :defaults account-path)) "messages.log"))
+
+(defun %append-messages (acct path)
+  "Append the queued messages to the log, one READable (group-id . plist) per line."
+  (when (account-unsaved-messages acct)
+    (let ((log (%messages-path path)))
+      (unless (probe-file log)
+        (with-open-file (out log :direction :output :if-does-not-exist :create) (declare (ignorable out)))
+        (chmod-private log))
+      (with-open-file (out log :direction :output :if-exists :append :external-format :utf-8)
+        (with-standard-io-syntax
+          (let ((*package* (find-package '#:cl-marmot)) (*print-pretty* nil) (*print-readably* nil))
+            (dolist (entry (reverse (account-unsaved-messages acct)))
+              (prin1 entry out)
+              (terpri out))))))
+    (setf (account-unsaved-messages acct) '())))
+
 (defun save-account (acct path)
-  (let ((tmp (concatenate 'string (namestring path) ".tmp")))
-    (ensure-directories-exist path)
-    ;; create the temporary file empty and private before any secret is written
-    (with-open-file (out tmp :direction :output :if-exists :supersede) (declare (ignorable out)))
-    (chmod-private tmp)
-    ;; :overwrite keeps the (private) file we just made rather than replacing it
-    (with-open-file (out tmp :direction :output :if-exists :overwrite :external-format :utf-8)
-      (with-standard-io-syntax
-        (let ((*package* (find-package '#:cl-marmot))
-              (*print-readably* nil)
-              (*print-pretty* nil))
-          (prin1 (account->sexp acct) out)
-          (terpri out))))
-    (rename-file tmp path)
+  "Write ACCT to PATH (and its new messages to the log beside it).  The account
+file is rewritten only when its contents changed."
+  (%append-messages acct path)
+  (let ((text (with-standard-io-syntax
+                (let ((*package* (find-package '#:cl-marmot))
+                      (*print-readably* nil)
+                      (*print-pretty* nil))
+                  (prin1-to-string (account->sexp acct))))))
+    (unless (and (account-last-saved acct) (string= text (account-last-saved acct)) (probe-file path))
+      (let ((tmp (concatenate 'string (namestring path) ".tmp")))
+        (ensure-directories-exist path)
+        ;; create the temporary file empty and private before any secret is written
+        (with-open-file (out tmp :direction :output :if-exists :supersede) (declare (ignorable out)))
+        (chmod-private tmp)
+        ;; :overwrite keeps the (private) file we just made rather than replacing it
+        (with-open-file (out tmp :direction :output :if-exists :overwrite :external-format :utf-8)
+          (write-string text out)
+          (terpri out))
+        (rename-file tmp path))
+      (setf (account-last-saved acct) text))
     path))
 
 (defun load-account (path)
-  (with-open-file (in path :external-format :utf-8)
-    (with-standard-io-syntax
-      (let ((*package* (find-package '#:cl-marmot))
-            (*read-eval* nil))
-        (sexp->account (read in))))))
+  (let ((acct (with-open-file (in path :external-format :utf-8)
+                (with-standard-io-syntax
+                  (let ((*package* (find-package '#:cl-marmot))
+                        (*read-eval* nil))
+                    (sexp->account (read in)))))))
+    ;; pre-log files kept messages inside each group: move them to the log
+    (loop for mg being the hash-values of (account-groups acct)
+          do (dolist (m (reverse (marmot-group-messages mg)))
+               (push (cons (mg-id-hex mg) m) (account-unsaved-messages acct))))
+    ;; the log, oldest first
+    (let ((log (%messages-path path)))
+      (when (probe-file log)
+        (with-open-file (in log :external-format :utf-8)
+          (with-standard-io-syntax
+            (let ((*package* (find-package '#:cl-marmot)) (*read-eval* nil))
+              (loop for entry = (ignore-errors (read in nil :eof))
+                    until (or (eq entry :eof) (null entry))
+                    do (let ((mg (gethash (car entry) (account-groups acct))))
+                         (when mg (push (cdr entry) (marmot-group-messages mg))))))))))
+    acct))
 
 ;;; ---------------------------------------------------------------------------
 ;;; One process per account
