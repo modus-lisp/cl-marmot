@@ -166,3 +166,45 @@
       (let ((*package* (find-package '#:cl-marmot))
             (*read-eval* nil))
         (sexp->account (read in))))))
+
+;;; ---------------------------------------------------------------------------
+;;; One process per account
+;;;
+;;; Two processes that each load the account, send, and save would each start
+;;; from the same secret-tree state and encrypt under the same MLS ratchet
+;;; generation: key and nonce reuse.  So every command that loads an account
+;;; holds an exclusive lock file for its whole run.  The file records the
+;;; holder's pid; a lock whose process no longer exists (checked through /proc
+;;; where there is one) is stale and is taken over.
+
+(defun %pid ()
+  (let ((f (or (%ext-fn "SB-POSIX" "GETPID") (%ext-fn "SB-UNIX" "UNIX-GETPID"))))
+    (and f (ignore-errors (funcall f)))))
+
+(defun %pid-alive-p (pid)
+  "T, NIL, or :UNKNOWN when this system cannot tell."
+  (cond ((not (integerp pid)) :unknown)
+        ((not (probe-file "/proc/self/")) :unknown)
+        (t (and (probe-file (format nil "/proc/~D/" pid)) t))))
+
+(defun %try-create-lock (lock-path)
+  (with-open-file (out lock-path :direction :output :if-exists nil :if-does-not-exist :create)
+    (when out
+      (format out "~D ~D~%" (or (%pid) 0) (unix-time))
+      t)))
+
+(defun call-with-account-lock (account-path fn)
+  (let ((lock (concatenate 'string (namestring account-path) ".lock")))
+    (ensure-directories-exist lock)
+    (unless (%try-create-lock lock)
+      (let* ((holder (ignore-errors (with-open-file (in lock) (read in nil nil))))
+             (alive (%pid-alive-p holder)))
+        (if (and (null alive) (ignore-errors (delete-file lock)) (%try-create-lock lock))
+            nil                         ; stale lock taken over
+            (error "the account is in use by another marmot process~@[ (pid ~D)~]; ~
+                    if that is wrong, remove ~A" (and (integerp holder) (plusp holder) holder) lock))))
+    (unwind-protect (funcall fn)
+      (ignore-errors (delete-file lock)))))
+
+(defmacro with-account-lock ((account-path) &body body)
+  `(call-with-account-lock ,account-path (lambda () ,@body)))

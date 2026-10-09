@@ -93,6 +93,7 @@ State: $MARMOT_HOME/account.sexp (default ~/.local/share/cl-marmot/)
        (multiple-value-bind (flags pos) (%parse-flags rest)
          (declare (ignore pos))
          (when (probe-file (account-path)) (error "account already exists at ~A" (account-path)))
+         (with-account-lock ((account-path))
          (let* ((relays (or (mapcar #'cdr (remove "relay" flags :key #'car :test-not #'string=))
                             (list "wss://relay.damus.io")))
                 (nsec (cdr (assoc "nsec" flags :test #'string=)))
@@ -101,13 +102,14 @@ State: $MARMOT_HOME/account.sexp (default ~/.local/share/cl-marmot/)
            (setup-account acct :name (cdr (assoc "name" flags :test #'string=)))
            (%save acct)
            (%out "~A~%" (account-npub acct))
-           0)))
+           0))))
       (t
-       (let ((acct (%load-or-die)))
-         (unwind-protect
-              (progn (%cli-account-command acct cmd rest) 0)
-           (%save acct)
-           (close-account-pools acct)))))))
+       (with-account-lock ((account-path))
+         (let ((acct (%load-or-die)))
+           (unwind-protect
+                (progn (%cli-account-command acct cmd rest) 0)
+             (%save acct)
+             (close-account-pools acct))))))))
 
 (defun %cli-account-command (acct cmd args)
   ;; only `sync` and `watch` narrate incoming traffic; other commands sync quietly
