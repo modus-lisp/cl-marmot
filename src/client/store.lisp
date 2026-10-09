@@ -148,6 +148,7 @@
         :cursor (marmot-group-cursor mg)
         :deferred (mapcar (lambda (d) (event->json (cdr d))) (marmot-group-deferred mg))
         :leaving (marmot-group-leaving mg)
+        :media-secrets (mapcar (lambda (c) (list (car c) (%h (cdr c)))) (marmot-group-media-secrets mg))
         :log (mapcar (lambda (n) (loop for (k v) on n by #'cddr
                                        append (list k (if (typep v '(vector (unsigned-byte 8))) (%h v) v))))
                      (marmot-group-log mg))))
@@ -159,6 +160,8 @@
                                :messages (getf s :messages)
                                :log (getf s :log)
                                :leaving (getf s :leaving)
+                               :media-secrets (mapcar (lambda (c) (cons (first c) (hex->octets (second c))))
+                                                      (getf s :media-secrets))
                                :cursor (or (getf s :cursor) 0)
                                :deferred (loop for j in (getf s :deferred)
                                                for e = (ignore-errors (json->event j :require-sig t))

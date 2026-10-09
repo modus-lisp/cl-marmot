@@ -27,4 +27,5 @@
                     (#:nip59 #:cl-nostr.nip59)
                     (#:pool #:cl-nostr.pool)
                     (#:flt #:cl-nostr.filter)
-                    (#:nip05 #:cl-nostr.nip05)))
+                    (#:nip05 #:cl-nostr.nip05)
+                    (#:blossom #:cl-nostr.blossom)))

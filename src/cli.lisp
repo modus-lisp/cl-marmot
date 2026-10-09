@@ -20,6 +20,9 @@
   marmot remove CHAT WHO...          marmot self-update CHAT
   marmot promote CHAT WHO            marmot demote CHAT WHO
   marmot leave CHAT
+  marmot send-file CHAT FILE... [--caption TEXT] [--type MIME] [--server URL]
+  marmot fetch CHAT MESSAGE [INDEX] [--out PATH]
+                                     MESSAGE is a message id or a prefix of one
 WHO is an npub, a hex pubkey or a NIP-05 address (name@domain).
 CHAT is a chat id, a unique prefix of one, or a chat name.
 State: $MARMOT_HOME/account.sexp (default ~/.local/share/cl-marmot/)
@@ -41,7 +44,12 @@ State: $MARMOT_HOME/account.sexp (default ~/.local/share/cl-marmot/)
             (message-content m)
             (format nil "(kind ~D) ~A" (message-kind m) (message-content m)))
         (message-edited-p m)
-        (mapcar #'cdr (message-reactions m))))
+        (mapcar #'cdr (message-reactions m)))
+  (dolist (a (message-attachments m))
+    (if (attachment-valid-p a)
+        (%out "    [~D] ~A  ~A  (fetch ~A ~D)~%" (attachment-index a) (attachment-filename a)
+              (attachment-media-type a) (%short (message-id m)) (attachment-index a))
+        (%out "    [~D] invalid attachment: ~A~%" (attachment-index a) (attachment-problem a)))))
 
 (defun %print-event (e)
   (let ((chat (event-chat e)))
@@ -106,6 +114,29 @@ the exit code."
       ((string= cmd "leave") (leave client (chat)) (%out "leave requested~%"))
       ((string= cmd "self-update") (self-update client (chat)) (%out "epoch ~D~%" (chat-epoch (chat))))
       ((string= cmd "send") (send client (chat) (%text (rest args))) (%out "sent~%"))
+      ((string= cmd "send-file")
+       (multiple-value-bind (flags pos) (%parse-flags (rest args))
+         (flet ((flag (n) (cdr (assoc n flags :test #'string=))))
+           (unless pos (error 'marmot-error :message "send-file needs at least one file"))
+           (let ((m (send-files client (chat) (mapcar #'pathname pos) :caption (or (flag "caption") "")
+                                :media-type (flag "type") :server (flag "server"))))
+             (%out "sent ~A~%" (%short (message-id m)))
+             (dolist (a (message-attachments m))
+               (%out "    [~D] ~A  ~A  ~A~%" (attachment-index a) (attachment-filename a)
+                     (attachment-media-type a) (cdr (first (attachment-locators a)))))))))
+      ((string= cmd "fetch")
+       (multiple-value-bind (flags pos) (%parse-flags (rest args))
+         (let* ((c (chat))
+                (id (or (first pos) (error 'marmot-error :message "fetch needs a message id")))
+                (matches (remove-if-not (lambda (m) (and (>= (length (message-id m)) (length id))
+                                                         (string= id (message-id m) :end2 (length id))))
+                                        (chat-messages c :kinds :all)))
+                (m (if (= (length matches) 1)
+                       (first matches)
+                       (error 'marmot-error :message (format nil "~:[no~;more than one~] message ~A" matches id))))
+                (out (cdr (assoc "out" flags :test #'string=))))
+           (%out "saved ~A~%" (namestring (save-attachment client c m (if out (pathname out) (truename "."))
+                                                           :index (if (second pos) (parse-integer (second pos)) 0)))))))
       ((string= cmd "messages")
        (sync client)
        (let ((c (chat)))
@@ -217,8 +248,29 @@ nothing is listening."
       (loop (sleep 3600)))
   0)
 
+(defun %absolute-paths (args)
+  "File arguments of send-file / fetch, made absolute: a daemon has its own cwd."
+  (let ((cmd (first args)))
+    (flet ((absolute (p) (namestring (merge-pathnames p (truename "."))))
+           (flag-p (a) (and (> (length a) 2) (string= "--" a :end2 2))))
+      (cond ((string= cmd "send-file")
+             ;; send-file CHAT FILE... --flag VALUE: files are the non-flag words after CHAT
+             (loop for (a . more) on args
+                   for i from 0
+                   for after-flag = nil then (flag-p prev)
+                   for prev = a
+                   collect (if (and (>= i 2) (not (flag-p a)) (not after-flag)) (absolute a) a)))
+            ((string= cmd "fetch")
+             (let* ((pos (position "--out" args :test #'string=))
+                    (out (and pos (nth (1+ pos) args))))
+               (append (if pos (subseq args 0 pos) args)
+                       (list "--out" (if out (absolute out) (namestring (truename "."))))
+                       (and pos (nthcdr (+ pos 2) args)))))
+            (t args)))))
+
 (defun %cli (args)
-  (let ((cmd (first args)) (rest (rest args)) (home (default-home)))
+  (let* ((args (if args (%absolute-paths args) args))
+         (cmd (first args)) (rest (rest args)) (home (default-home)))
     (cond
       ((or (null cmd) (member cmd '("help" "-h" "--help") :test #'string=)) (%out "~A" *usage*) 0)
       ((string= cmd "init")

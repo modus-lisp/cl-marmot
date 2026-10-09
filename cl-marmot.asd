@@ -39,11 +39,13 @@
       :components ((:file "components")
                    (:file "key-packages")
                    (:file "groups")
-                   (:file "convergence")))
+                   (:file "convergence")
+                   (:file "media")))
      (:module "client"
       :serial t
       :components ((:file "account")
-                   (:file "store")))
+                   (:file "store")
+                   (:file "media")))
      (:file "api")
      (:file "cli")))))
 
@@ -61,4 +63,5 @@
                  (:file "nostr-tests")
                  (:file "marmot-tests")
                  (:file "group-tests")
-                 (:file "convergence-tests")))))
+                 (:file "convergence-tests")
+                 (:file "media-tests")))))

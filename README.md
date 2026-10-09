@@ -34,6 +34,15 @@ It interoperates with mdk's `wn`, the engine whitenoise-linux links through `mar
 | SelfRemove both ways: `wn` leaves and we commit it; we hand over admin, leave, and `wn` commits it | ✓ |
 | rotate the KeyPackage a Welcome consumed; `wn` invites us again with the replacement | ✓ |
 
+Two more harnesses run against `wn` the same way:
+
+- `test/interop/run-wn-media.sh` (**18 of 18**) — encrypted media (`encrypted-media-v2`) both ways through a
+  local Blossom server (`nak serve --blossom`): files we send `wn` downloads byte-identical and vice versa, both
+  still open after an epoch change, and `wn` accepts the media policy in groups we create.
+- `test/interop/run-wn-scale.sh [N]` — one cl-marmot member in a group of N `wn` accounts: join, messages from
+  several members, removals, a rename, and two admins renaming at the same moment, after which everyone agrees on
+  the winner (13 members: 9 of 9).
+
 The MLS layer passes the MLS working group's interop vectors for cipher suite 1 — crypto-basics, tree-math,
 secret-tree, key-schedule, psk_secret, transcript-hashes, tree-validation, tree-operations, treekem,
 message-protection, messages, welcome and all three passive-client files (a 200-epoch random history with 1,542
@@ -43,7 +52,7 @@ McGrew–Viega GCM, all 19 BIP-340 rows), and the NIP-44 v2 vectors run against 
 
 ```
 test/fetch-vectors.sh          # the MLS WG and NIP-44 vectors, pinned and checksummed
-./run-tests.sh                 # 59 tests, 10,984 checks
+./run-tests.sh                 # 63 tests, 11,037 checks
 WN_BIN=/path/to/wn-dir test/interop/run-wn-interop.sh
 ```
 
@@ -94,6 +103,7 @@ The public API is the `MARMOT` package (`src/api.lisp`):
 | messages | `message-id` `message-chat-id` `message-sender` `message-kind` `message-content` `message-tags` `message-created-at` `message-epoch` `message-own-p` `message-edited-p` `message-reply-to` `message-reactions` `message-invalidated-p` |
 | people | `profile` `display-name` |
 | actions | `create-chat` `send` `invite` `remove-members` `rename` `promote` `demote` `leave` `self-update` |
+| attachments | `send-files` `message-attachments` `fetch-attachment` `save-attachment`; `attachment-filename` `attachment-media-type` `attachment-dim` `attachment-thumbhash` `attachment-plaintext-sha256` `attachment-ciphertext-sha256` `attachment-locators` `attachment-valid-p` `attachment-problem` `attachment-index` |
 | events | `sync` `start` `stop` `running-p` `add-handler` `remove-handler`; `event-type`, `event-chat`, `event-message`, `event-account`, `event-epoch`, `event-name`, `event-reason`, `event-commit`, `event-message-id`, `event-target-id`, `event-invitees` |
 
 `chat-messages` returns kind 9 chat messages with edits (kind 1009, by the original author) and reactions (kind 7)
@@ -102,6 +112,12 @@ applied; push-notification bookkeeping and group system rows are not messages. E
 `:pending-superseded` `:commit-invalidated` `:message-invalidated` `:rejected` (see the `event` docstring). When two
 members commit at once, every member converges on the same branch (`protocol-core/convergence.md`); if a change you
 were shown loses, `:commit-invalidated` and `:message-invalidated` say so.
+
+Attachments are encrypted to the chat (a key derived from the epoch's MLS exporter, ChaCha20-Poly1305) and the
+ciphertext is uploaded to the chat's Blossom servers, which chats we create set to `https://blossom.primal.net/`.
+The upload is authorized with the account key, as mdk does, so the Blossom server learns which account stored
+which blob — never its contents. Fetched files are checked against both hashes before they are returned.
+Loopback Blossom servers are only contacted with `MARMOT_ALLOW_LOOPBACK_MEDIA=1`.
 
 An open client owns its account: a lock file keeps other processes out (two writers would reuse MLS message keys),
 and a recursive lock makes the API safe to call from the application's threads while the background thread syncs.
@@ -115,6 +131,8 @@ bin/marmot create "" ynniv@ynniv.com                   # a one-to-one chat
 bin/marmot send 1e81d2b5 hello                          # CHAT: id, id prefix or name
 bin/marmot daemon &                                     # hold the account, sync in the background
 bin/marmot messages 1e81d2b5                            # ...forwarded to the daemon
+bin/marmot send-file 1e81d2b5 cat.jpg --caption "look"  # encrypted, via the chat's Blossom servers
+bin/marmot fetch 1e81d2b5 9f3c0a 0 --out ~/Downloads/   # attachment 0 of message 9f3c0a...
 ```
 
 Whatever process holds the account — `marmot daemon`, `marmot watch` (the same, printing what arrives), or an
@@ -138,11 +156,12 @@ src/crypto/   the crypto vocabulary MLS is written against, bridged to natrium /
 src/mls/      RFC 9420 + draft-ietf-mls-extensions-10: structures, HPKE, ratchet tree, key schedule,
               secret tree, framing, group state machine (create/commit/process/Welcome/join)
 src/nostr/    Marmot-strict event decoding and tag rules over cl-nostr
-src/marmot/   app components, KeyPackages (kind 30443), group validation, kind 445 envelopes, app events
-src/client/   account orchestration, persistent store, account lock
+src/marmot/   app components, KeyPackages (kind 30443), group validation, kind 445 envelopes, app events,
+              convergence, encrypted media (policy, imeta, keys)
+src/client/   account orchestration, persistent store, account lock, Blossom upload/fetch
 src/api.lisp  the public MARMOT package
 src/cli.lisp  the `marmot` command line and its socket
-test/         unit tests, MLS/NIP-44 vectors, wn interop harness
+test/         unit tests, MLS/NIP-44 vectors, wn interop harnesses (protocol, media, scale)
 ```
 
 ## Not done yet
@@ -150,6 +169,8 @@ test/         unit tests, MLS/NIP-44 vectors, wn interop harness
 - **Convergence** follows the spec's branch selection within the rollback horizon, but not its millisecond
   collection windows (each sync batch plays that role), retained-history replay beyond the horizon, or disband
   terminalization.
-- **Encrypted media** (MIP-04 / `encrypted-media-v2`), Blossom images, push notifications, NIP-46 remote signers,
-  disbanding, and agent text streams beyond the receive-role fallback.
+- Group images (Blossom avatars), changing a chat's media servers, legacy `encrypted-media-v1` references, push
+  notifications, NIP-46 remote signers, disbanding, and agent text streams beyond the receive-role fallback.
+- **Large groups**: we only commit other members' SelfRemove proposals in chats of 8 or fewer
+  (`*auto-commit-max-members*`); in larger chats an admin's own client is expected to do it, so we do not race it.
 - **Modus**: cl-marmot loads on Modus, but runs far slower there than on SBCL; SBCL is the supported platform.

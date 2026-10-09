@@ -33,6 +33,11 @@
    #:message #:message-id #:message-chat-id #:message-sender #:message-kind #:message-content
    #:message-tags #:message-created-at #:message-epoch #:message-own-p #:message-invalidated-p
    #:message-edited-p #:message-reply-to #:message-reactions
+   ;; attachments (encrypted media)
+   #:message-attachments #:attachment #:attachment-index #:attachment-filename #:attachment-media-type
+   #:attachment-dim #:attachment-thumbhash #:attachment-plaintext-sha256 #:attachment-ciphertext-sha256
+   #:attachment-locators #:attachment-valid-p #:attachment-problem
+   #:send-files #:fetch-attachment #:save-attachment
    ;; people
    #:profile #:display-name
    ;; actions
@@ -431,6 +436,95 @@ empty NAME is how a one-to-one conversation is usually presented."
   "Rotate our keys in CHAT (forward secrecy and post-compromise security)."
   (%action (client) (cl-marmot::self-update acct (%chat client chat)) (%chat client chat)))
 
+;;; ---------------------------------------------------------------------------
+;;; Attachments (encrypted media v2: files encrypted to the chat, stored on Blossom)
+
+(defstruct (attachment (:constructor %make-attachment))
+  "A file attached to a message."
+  index              ; position among the message's attachments, from 0
+  filename           ; the name the sender gave it
+  media-type         ; canonical MIME type
+  dim                ; "WIDTHxHEIGHT" render hint, or NIL
+  thumbhash          ; preview, or NIL
+  plaintext-sha256   ; hex SHA-256 of the file
+  ciphertext-sha256  ; hex SHA-256 of the stored blob
+  locators           ; list of (kind . url) the sender gave
+  valid-p            ; NIL if the reference failed validation (see PROBLEM)
+  problem)           ; why it is invalid
+
+(defun message-attachments (message)
+  "MESSAGE's attachments, in order, including invalid references (VALID-P NIL)
+so positions stay stable."
+  (loop for a in (cl-marmot::message-attachments (message-tags message))
+        for i from 0
+        collect (if (getf a :rejected)
+                    (%make-attachment :index i :valid-p nil :problem (getf a :rejected))
+                    (%make-attachment :index i :filename (getf a :filename) :media-type (getf a :media-type)
+                                      :dim (getf a :dim) :thumbhash (getf a :thumbhash)
+                                      :plaintext-sha256 (getf a :plaintext-sha256)
+                                      :ciphertext-sha256 (getf a :ciphertext-sha256)
+                                      :locators (getf a :locators) :valid-p t))))
+
+(defun %read-file-octets (path)
+  (with-open-file (in path :element-type '(unsigned-byte 8))
+    (let ((v (make-array (file-length in) :element-type '(unsigned-byte 8))))
+      (read-sequence v in)
+      v)))
+
+(defun %file-plist (f media-type)
+  (if (and (consp f) (keywordp (first f)))
+      f
+      (list :data (%read-file-octets f) :filename (file-namestring f)
+            :media-type media-type)))
+
+(defun send-files (client chat files &key (caption "") media-type server)
+  "Encrypt FILES, upload them to the chat's Blossom servers and send one message
+carrying them with CAPTION.  Each file is a pathname, or a plist (:DATA octets
+:FILENAME name &optional :MEDIA-TYPE :DIM :THUMBHASH).  MEDIA-TYPE overrides
+the type guessed from a pathname's extension; SERVER overrides the chat's
+servers.  Returns the MESSAGE."
+  (let ((files (mapcar (lambda (f) (%file-plist f media-type)) (if (and (listp files) (not (keywordp (first files)))) files (list files)))))
+    (%action (client)
+      (let ((chat (%chat client chat)))
+        (cl-marmot::send-media acct chat files :caption caption :server server)
+        (%message chat (first (cl-marmot::marmot-group-messages chat)))))))
+
+(defun %message-plist (chat message)
+  (let ((id (if (message-p message) (message-id message) message)))
+    (or (find id (cl-marmot::marmot-group-messages chat) :key (lambda (p) (getf p :id)) :test #'equal)
+        (error 'marmot-error :message (format nil "no message ~A in this chat" id)))))
+
+(defun fetch-attachment (client chat message &optional (index 0))
+  "Download, verify and decrypt attachment INDEX of MESSAGE (a MESSAGE or its id).
+Returns (values octets attachment).  Signals MARMOT-ERROR if it is unavailable."
+  (let (plist mg)
+    (%locked (client)
+      (setf mg (%chat client chat) plist (%message-plist mg message)))
+    ;; network outside the lock: a slow server must not stall sync
+    (let ((octets (cl-marmot::fetch-media mg plist index)))
+      (values octets (nth index (message-attachments (%message mg plist)))))))
+
+(defun save-attachment (client chat message path &key (index 0))
+  "Fetch attachment INDEX of MESSAGE into PATH (a directory gets the sender's
+file name).  Returns the pathname written."
+  (multiple-value-bind (octets att) (fetch-attachment client chat message index)
+    (let* ((existing (ignore-errors (probe-file path)))
+           (dir (or (and existing (null (pathname-name existing)) existing)
+                    (and (null (pathname-name path)) (null (pathname-type path)) (pathname path))))
+           ;; the sender chose the name: keep only its last component
+           (name (let ((n (attachment-filename att)))
+                   (setf n (subseq n (1+ (or (position #\/ n :from-end t) -1))))
+                   (if (member n '("" "." "..") :test #'string=) "attachment" n)))
+           (out (if dir
+                    ;; native: a name with * or ~ is a file name, not a wildcard
+                    (merge-pathnames (cl-marmot::%call "SB-EXT" "PARSE-NATIVE-NAMESTRING" name) dir)
+                    (pathname path))))
+      ;; decrypted media is as private as the chat: owner-only, like the account files
+      (with-open-file (o out :direction :output :element-type '(unsigned-byte 8) :if-exists :supersede)
+        (cl-marmot::chmod-private (namestring out))
+        (write-sequence octets o))
+      out)))
+
 ;;; Accessor documentation (the struct definitions carry it only as comments)
 
 (loop for (name doc) on
@@ -447,6 +541,16 @@ empty NAME is how a one-to-one conversation is usually presented."
         message-edited-p "Does its content come from an edit?"
         message-reply-to "Hex id of the message it replies to, or NIL."
         message-reactions "Its reactions: a list of (sender-hex . content)."
+        attachment-index "Its position among the message's attachments, from 0."
+        attachment-filename "The file name its sender gave."
+        attachment-media-type "Its canonical MIME type."
+        attachment-dim "\"WIDTHxHEIGHT\" render hint, or NIL."
+        attachment-thumbhash "A thumbhash preview, or NIL."
+        attachment-plaintext-sha256 "Hex SHA-256 of the file."
+        attachment-ciphertext-sha256 "Hex SHA-256 of the encrypted blob."
+        attachment-locators "Where the sender stored it: a list of (kind . url)."
+        attachment-valid-p "Did the reference pass validation?  Invalid ones cannot be fetched."
+        attachment-problem "Why the reference is invalid, or NIL."
         event-type "What happened; see the EVENT structure's documentation."
         event-chat "The chat it happened in."
         event-message "The MESSAGE, for :message, :edit, :reaction and :app-event."

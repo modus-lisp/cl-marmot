@@ -35,7 +35,8 @@ fork and still win; also how many prior states are kept for late messages.")
   pending                 ; STAGED-COMMIT awaiting publication
   (messages '())          ; delivered app events, newest first (plist per message)
   (log '())               ; state notifications, newest first
-  (leaving nil))          ; T after we published a SelfRemove (member-departure.md)
+  (leaving nil)           ; T after we published a SelfRemove (member-departure.md)
+  (media-secrets '()))    ; ("epoch:node-digest" . secret), newest first (media.lisp)
 
 (defun mg-id (mg) (mls-group-id (marmot-group-mls mg)))
 (defun mg-id-hex (mg) (octets->hex (mg-id mg)))
@@ -281,6 +282,8 @@ commit tree and convergence decides which branch is canonical."
                                    :tags (ev:event-tags app) :id (ev:event-id app)
                                    :created-at (ev:event-created-at app) :node (cnode-digest node))))
                       (pushnew (ev:event-pubkey app) (cnode-senders node) :test #'string=)
+                      (when (message-imeta-tags (ev:event-tags app))
+                        (remember-media-secret mg state (cnode-digest node)))
                       (if (%canonical-p mg node)
                           (progn (push m (marmot-group-messages mg))
                                  ;; a witness can change which branch wins
@@ -324,7 +327,8 @@ failure without touching BUNDLE."
 ;;; ---------------------------------------------------------------------------
 ;;; Creating groups and committing (publish-before-apply)
 
-(defun marmot-group-context-extensions (&key creator-account admins nostr-group-id relays name description)
+(defun marmot-group-context-extensions (&key creator-account admins nostr-group-id relays name description
+                                              (media-endpoints *default-media-endpoints*))
   (list
    (make-extension :type +ext-required-capabilities+
                    :data (tls-serialize 'required-capabilities
@@ -336,15 +340,23 @@ failure without touching BUNDLE."
     (remove nil
             (list (make-component-data :component-id +component-app-components+
                                        :data (encode-component-id-list
-                                              (list +c-admin-policy+ +c-nostr-routing+
-                                                    +c-identity-proof+ +c-lifecycle+)))
+                                              (sort (append (list +c-admin-policy+ +c-nostr-routing+
+                                                                  +c-identity-proof+ +c-lifecycle+)
+                                                            (and media-endpoints (list +c-encrypted-media-v2+)))
+                                                    #'<)))
                   (and name (make-component-data :component-id +c-profile+
                                                  :data (encode-group-profile name (or description ""))))
                   (make-component-data :component-id +c-admin-policy+
                                        :data (encode-admin-policy (or admins (list creator-account))))
                   (make-component-data :component-id +c-nostr-routing+
                                        :data (encode-nostr-routing nostr-group-id relays))
-                  (make-component-data :component-id +c-lifecycle+ :data (encode-lifecycle :active)))))))
+                  (make-component-data :component-id +c-lifecycle+ :data (encode-lifecycle :active))
+                  (and media-endpoints
+                       (make-component-data :component-id +c-encrypted-media-v2+
+                                            :data (encode-media-policy
+                                                   (list +blossom-locator+)
+                                                   (mapcar (lambda (u) (cons +blossom-locator+ u))
+                                                           media-endpoints)))))))))
 
 (defun create-marmot-group (account-sk &key name (description "") relays (admins nil))
   "Epoch 0 of a new group whose only member is us.  Returns a MARMOT-GROUP."
@@ -448,9 +460,13 @@ leaving leaf: the one with the lowest proposal digest."
                       (let ((e (+ (ev:event-created-at app) secs)))
                         (and (< e (expt 2 64)) e)))))
     (setf (gethash (octets->hex (sha256 bytes)) (marmot-group-seen mg)) (mg-epoch mg))
+    (%ensure-tree mg)
+    (when (message-imeta-tags tags)
+      (remember-media-secret mg mls (cnode-digest (marmot-group-tip mg))))
     (push (list :type :message :epoch (mls-group-epoch mls) :sender (ev:event-pubkey app)
                 :kind kind :content content :tags tags :id (ev:event-id app)
-                :created-at (ev:event-created-at app) :own t)
+                :created-at (ev:event-created-at app) :own t
+                :node (cnode-digest (marmot-group-tip mg)))
           (marmot-group-messages mg))
     (seal-group-message mls bytes :expiration expiry)))
 
