@@ -20,6 +20,7 @@
       :serial t
       :components ((:file "conditions")
                    (:file "sha2")
+                   (:file "sha1")
                    (:file "hmac")
                    (:file "chacha20")
                    (:file "aes-gcm")
@@ -33,7 +34,21 @@
                    (:file "tree")
                    (:file "key-schedule")
                    (:file "framing")
-                   (:file "group")))))))
+                   (:file "group")))
+     (:module "nostr"
+      :serial t
+      :components ((:file "event")
+                   (:file "nip44")
+                   (:file "websocket")
+                   (:file "relay")))
+     (:module "marmot"
+      :serial t
+      :components ((:file "components")
+                   (:file "key-packages")
+                   (:file "groups")))
+     (:module "client"
+      :serial t
+      :components ((:file "account")))))))
 
 (asdf:defsystem #:cl-marmot/test
   :depends-on (#:cl-marmot)
@@ -44,4 +59,6 @@
     :components ((:file "harness")
                  (:file "crypto-tests")
                  (:file "util-tests")
-                 (:file "mls-vector-tests")))))
+                 (:file "mls-vector-tests")
+                 (:file "nostr-tests")
+                 (:file "marmot-tests")))))
