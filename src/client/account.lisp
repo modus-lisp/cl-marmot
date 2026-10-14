@@ -147,12 +147,17 @@ arrays) until DONE-P returns true for one.  Returns that message, or signals."
 
 (defun publish-accepted-p (results) (some #'second results))
 
-(defun pool-query (acct urls filters)
-  "Stored events matching FILTERS on URLS, each one verified (id + signature)."
+(defun pool-query (acct urls filters &key skip)
+  "Stored events matching FILTERS on URLS, each one verified (id + signature).
+SKIP, a predicate, drops events BEFORE they are verified: verification is the
+expensive part (a Schnorr check per event -- ~300 ms on modus today), and a query
+whose window always reaches back over events already handled would otherwise pay
+for all of them again on every sync."
   (remove-if-not #'verify-event
-                 (if (%direct-p)
-                     (%direct-query acct urls filters)
-                     (pool:fetch-events (%pool-for acct urls) filters :timeout *relay-timeout*))))
+                 (let ((events (if (%direct-p)
+                                   (%direct-query acct urls filters)
+                                   (pool:fetch-events (%pool-for acct urls) filters :timeout *relay-timeout*))))
+                   (if skip (remove-if skip events) events))))
 
 (defun %publish (acct urls ev &key (require t))
   (let ((results (pool-publish* acct urls ev)))
@@ -430,9 +435,13 @@ results produced."
     (retry-pending-commits acct)
     (flush-outbox acct)
     (maintain-key-packages acct)
+    ;; The window reaches back three days on every sync (gift wraps are backdated),
+    ;; so most of what comes back has been processed already: drop those before
+    ;; their signatures are checked, or a sync costs every wrap ever received.
     (dolist (wrap (pool-query acct (account-relays acct)
                               (list (flt:make-filter :kinds '(1059) :tags (list (cons "p" (list (account-pubkey-hex acct))))
-                                                     :since since))))
+                                                     :since since))
+                              :skip (lambda (e) (gethash (ev:event-id e) (account-seen-wraps acct)))))
       (let ((mg (process-gift-wrap acct wrap)))
         (when mg (push (list :type :joined :group (mg-id-hex mg)) results))))
     ;; group traffic: what is new since each chat's cursor, oldest first
